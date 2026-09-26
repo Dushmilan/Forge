@@ -1,0 +1,15 @@
+# Compiled binaries
+/forge
+/cmd/forge/forge
+*.exe
+*.test
+*.out
+
+# Coverage / profiling artifacts
+*.cover
+*.prof
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
