@@ -22,7 +22,7 @@ type Status int
 // iota numbers these constants 0, 1, 2, 3. StatusPending is deliberately the
 // zero value, so a freshly declared Job is already "pending" with no extra work.
 const (
-	StatusPending Status = iota
+	StatusPending Status = iota // starts at 0
 	StatusRunning
 	StatusSucceeded
 	StatusFailed
