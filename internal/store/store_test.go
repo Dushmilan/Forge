@@ -1,0 +1,109 @@
+package store_test
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+
+	"github.com/Dushmilan/Forge/internal/executor"
+	"github.com/Dushmilan/Forge/internal/job"
+	"github.com/Dushmilan/Forge/internal/store"
+)
+
+// TestSaveGetRoundTrip pins the store's whole reason to exist: what Save
+// writes, a *fresh* Store instance (newly constructed, as after a process
+// restart) reads back unchanged. The nested directory that does not exist yet
+// pins that Save creates it — production starts with no ./data.
+func TestSaveGetRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "data")
+	s := store.New(dir)
+
+	want := store.Record{
+		ID:      "abc123",
+		Command: []string{"echo", "hi"},
+		Status:  job.StatusSucceeded,
+		Result:  executor.Result{ExitCode: 0, Stdout: "hi\n"},
+	}
+	if err := s.Save(want); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	got, err := store.New(dir).Get("abc123")
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if got.ID != want.ID || got.Status != want.Status || got.Result.Stdout != want.Result.Stdout {
+		t.Errorf("Get() = %+v, want %+v", got, want)
+	}
+
+	// The file on disk must name the status as a string — this is what
+	// consumes Task 1's MarshalJSON and pins the storage format.
+	b, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatalf("read jobs.json: %v", err)
+	}
+	if !bytes.Contains(b, []byte(`"status": "succeeded"`)) {
+		t.Errorf("jobs.json = %s, want status as string", b)
+	}
+}
+
+// TestGetMissing wraps the sentinel: callers distinguish "no such job"
+// (404 later) from "the disk is on fire" (500) with errors.Is, so the
+// identity must survive the message formatting.
+func TestGetMissing(t *testing.T) {
+	s := store.New(t.TempDir())
+
+	_, err := s.Get("ghost")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCorruptFileFailsLoudly pins the failure mode for a jobs.json that a
+// crash left half-written (Review Focus 5): both operations surface an
+// error, neither panics, and Save does NOT clobber what it cannot read.
+func TestCorruptFileFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(dir)
+
+	if _, err := s.Get("any"); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get(corrupt) = %v, want a decode error (not ErrNotFound)", err)
+	}
+	if err := s.Save(store.Record{ID: "new"}); err == nil {
+		t.Error("Save(corrupt) = nil, want a decode error — silent overwrite loses data")
+	}
+}
+
+// TestConcurrentSaves pins the mutex's reason to exist at the store level
+// (Review Focus 4): without it, racing read-modify-write cycles lose
+// records — and -race flags the data race. Five goroutines, five records,
+// all five must survive.
+func TestConcurrentSaves(t *testing.T) {
+	s := store.New(t.TempDir())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done() // defer inside the goroutine runs before wg.Done returns up the stack
+			id := string(rune('a' + i))
+			if err := s.Save(store.Record{ID: id, Status: job.StatusSucceeded}); err != nil {
+				t.Errorf("Save(%s) error: %v", id, err)
+			}
+		}(i)
+	}
+	wg.Wait() // the channel-based join: Wait blocks until every Done has fired
+
+	for i := 0; i < 5; i++ {
+		id := string(rune('a' + i))
+		if _, err := s.Get(id); err != nil {
+			t.Errorf("Get(%s) after concurrent saves: %v", id, err)
+		}
+	}
+}
