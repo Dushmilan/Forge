@@ -4,6 +4,7 @@
 package job
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -46,6 +47,39 @@ func (s Status) String() string {
 		// re-enter String() through fmt's Stringer path and recurse forever.
 		return fmt.Sprintf("Status(%d)", int(s))
 	}
+}
+
+// MarshalJSON renders a Status as its String() name ("succeeded", not 2).
+// This is json.Marshaler: encoding/json checks for this method before the
+// default int encoding, so the wire format changes without touching any
+// caller. Files and API responses stay readable years later.
+func (s Status) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.String())
+}
+
+// UnmarshalJSON decodes a Status from its string name. The pointer receiver
+// is required: encoding/json only calls UnmarshalJSON on an addressable
+// value, and this method must write back through *s. It returns an error for
+// unknown names rather than leaving the zero value — a corrupt stored file
+// should fail loudly, never load as "pending" by accident.
+func (s *Status) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("job: status must be a string: %w", err)
+	}
+	switch name {
+	case "pending":
+		*s = StatusPending
+	case "running":
+		*s = StatusRunning
+	case "succeeded":
+		*s = StatusSucceeded
+	case "failed":
+		*s = StatusFailed
+	default:
+		return fmt.Errorf("job: unknown status %q", name)
+	}
+	return nil
 }
 
 // Compile-time proof that Status implements fmt.Stringer. If the method set

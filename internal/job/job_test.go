@@ -1,6 +1,7 @@
 package job_test
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -67,5 +68,53 @@ func TestJobValidate(t *testing.T) {
 				t.Errorf("Validate() error = %v, want it to wrap ErrInvalidJob", err)
 			}
 		})
+	}
+}
+
+// TestStatusJSONRoundTrip pins Status to its string name across JSON, so a
+// persisted job reads "succeeded" instead of the opaque iota 2. It also pins
+// that only known names decode — a typo in a stored file must be an error,
+// not a silent Status(0).
+func TestStatusJSONRoundTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		status job.Status
+		want   string
+	}{
+		{name: "pending", status: job.StatusPending, want: `"pending"`},
+		{name: "running", status: job.StatusRunning, want: `"running"`},
+		{name: "succeeded", status: job.StatusSucceeded, want: `"succeeded"`},
+		{name: "failed", status: job.StatusFailed, want: `"failed"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := json.Marshal(tt.status)
+			if err != nil {
+				t.Fatalf("Marshal(%v) error: %v", tt.status, err)
+			}
+			if string(b) != tt.want {
+				t.Errorf("Marshal(%v) = %s, want %s", tt.status, b, tt.want)
+			}
+
+			var back job.Status
+			if err := json.Unmarshal(b, &back); err != nil {
+				t.Fatalf("Unmarshal(%s) error: %v", b, err)
+			}
+			if back != tt.status {
+				t.Errorf("round trip = %v, want %v", back, tt.status)
+			}
+		})
+	}
+}
+
+// TestStatusUnmarshalRejectsUnknown pins that decoding is strict: an
+// unrecognized name (and a bare number, which would decode against the old
+// int representation) is an error, not a zero-value Status.
+func TestStatusUnmarshalRejectsUnknown(t *testing.T) {
+	for _, in := range []string{`"weird"`, `2`} {
+		var s job.Status
+		if err := json.Unmarshal([]byte(in), &s); err == nil {
+			t.Errorf("Unmarshal(%s) = nil error, want error", in)
+		}
 	}
 }
