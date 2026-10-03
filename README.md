@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0 (single-process executor) is done. V1–V11 are planned.
+**Status:** V0 and V1 are done. V2–V11 are planned.
 
 ## Quick start
 
@@ -19,6 +19,21 @@ go build ./cmd/forge
 
 `forge` propagates the executed command's own exit code, so it composes like
 any other Unix tool. Called with no arguments it prints usage and exits 2.
+
+### As a server (V1)
+
+```sh
+go build ./cmd/forge
+./forge serve -addr :8080 -data ./data
+```
+
+```sh
+curl -X POST localhost:8080/jobs -d '{"command": ["echo", "hello"]}'   # 201 + record
+curl localhost:8080/jobs/<id>                                          # 200 + record
+```
+
+Jobs run synchronously: the POST response arrives when the command finishes,
+and every submitted job is persisted to `<data>/jobs.json` for later `GET`s.
 
 Run the tests:
 
@@ -46,12 +61,30 @@ args ──▶ cmd/forge ──▶ job.Job ──▶ executor.Executor ──▶
 - [`cmd/forge`](cmd/forge) — a testable CLI entrypoint: `main` only calls
   `os.Exit`, everything else lives in `run(args, stdout, stderr)`.
 
+## How it works (V1)
+
+`forge serve` adds an HTTP face and a memory. `POST /jobs` decodes the
+command, runs it **synchronously** (the request blocks — there is no queue
+yet, and V2's whole point is that this stops being true), persists a
+`Record`, and answers 201; `GET /jobs/{id}` reads it back:
+
+```
+POST /jobs ──▶ api.Server ──▶ executor.Runner ──▶ store.Save ──▶ 201 + Record
+GET /jobs/{id} ──────────────▶ store.Get ──────────────────────▶ 200 / 404
+```
+
+- [`internal/store`](internal/store) — one JSON file, atomic writes
+  (temp file + `os.Rename`), a mutex because `net/http` serves each
+  request on its own goroutine.
+- [`internal/api`](internal/api) — handlers on Go 1.22's method+pattern
+  mux; errors are always JSON (`{"error": "…"}`).
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
 |-----|--------------------------------|--------------------------------------------------|--------|
 | V0  | Single-process executor        | structs, interfaces, error handling, `testing`   | ✅     |
-| V1  | API + persistent jobs          | `net/http`, handlers, JSON, file/SQL persistence | ⏳     |
+| V1  | API + persistent jobs          | `net/http`, handlers, JSON, file/SQL persistence | ✅     |
 | V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ⏳     |
 | V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ⏳     |
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ⏳     |
@@ -72,10 +105,12 @@ later rung.
 Forge/
 ├── AGENTS.md              # rules for how this repo is built (TDD, the ladder)
 ├── go.mod                 # module github.com/Dushmilan/Forge
-├── cmd/forge/main.go      # CLI front end
+├── cmd/forge/main.go      # CLI + `forge serve` front end
 ├── internal/
-│   ├── job/               # Job, Status, validation
-│   └── executor/          # synchronous command execution
+│   ├── job/               # Job, Status, validation, JSON marshaling
+│   ├── executor/          # synchronous command execution
+│   ├── store/             # JSON file persistence (V1)
+│   └── api/               # HTTP handlers (V1)
 └── docs/
     ├── LEARNING.md        # one entry per version: what Go concept clicked
     └── versions/V0.md …   # spec for each version

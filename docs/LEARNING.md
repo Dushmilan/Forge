@@ -33,3 +33,24 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V1 — API + persistent jobs
+
+- **Concept:**
+  - `net/http` handlers and the Go 1.22 method+pattern mux
+    (`"GET /jobs/{id}"`, `r.PathValue`) — routing without a dependency.
+  - `encoding/json` round trips: `json.Marshaler`/`json.Unmarshaler` on a
+    named type, pointer receivers for decode, and why errors become strings
+    to cross a JSON boundary.
+  - File persistence: read-modify-write under a mutex, atomic write via
+    temp file + `os.Rename`, `fs.ErrNotExist` as "empty, not broken".
+  - `crypto/rand` for server-generated IDs; `httptest` and `t.TempDir()`
+    for tests that never touch the network or the real disk.
+  - `context` + `signal.NotifyContext` to shut a server down without
+    sleeping — channels as the synchronization primitive.
+- **What I built:** `internal/store` (JSON file store), `internal/api`
+  (POST /jobs runs synchronously and persists; GET /jobs/{id} reads it
+  back), and a `forge serve` subcommand that hosts them until interrupted.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_
