@@ -60,6 +60,19 @@ func (q *Queue) Run(ctx context.Context, handler func(store.Record)) {
 		case <-ctx.Done():
 			return
 		case rec := <-q.jobs:
+			/*
+				Both select cases can be ready at once (cancel raced a
+				delivery), and select chooses pseudo-randomly between ready
+				cases — so a cancelled worker must re-check before dispatching,
+				or a buffered record could still reach the handler after
+				shutdown. This inner non-blocking select is that priority
+				rule: cancellation always wins over delivery.
+			*/
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			handler(rec)
 		}
 	}

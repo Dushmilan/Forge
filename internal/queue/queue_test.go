@@ -131,3 +131,76 @@ func mustEnqueue(t *testing.T, ctx context.Context, q *queue.Queue, rec store.Re
 		t.Fatalf("Enqueue(%s): %v", rec.ID, err)
 	}
 }
+
+// TestRunReturnsWhenIdle pins: an idle worker exits promptly on cancel —
+// there is nothing to finish.
+func TestRunReturnsWhenIdle(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		q.Run(ctx, func(store.Record) {})
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle Run did not return after ctx cancel")
+	}
+}
+
+// TestRunFinishesCurrentAndDropsQueued pins the shutdown contract (Review
+// Focus 2): after cancel, the record being handled runs to completion, the
+// record still buffered is never delivered, and Run returns only after the
+// in-flight handler has returned.
+func TestRunFinishesCurrentAndDropsQueued(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	entered := make(chan struct{}, 2) // handler-entry signal, one slot per job
+	gate := make(chan struct{})       // blocks the handler until the test frees it
+	handled := make(chan string, 2)
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx, func(rec store.Record) {
+			entered <- struct{}{}
+			<-gate
+			handled <- rec.ID
+		})
+		close(runDone)
+	}()
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "in-flight"})
+	select { // wait until the worker has actually picked "in-flight" up
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker never picked up the first record")
+	}
+	mustEnqueue(t, ctx, q, store.Record{ID: "queued"}) // buffer; the worker is busy
+
+	cancel()
+	select { // finish-current: Run must NOT return while the handler runs
+	case <-runDone:
+		t.Fatal("Run returned while a handler was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	gate <- struct{}{} // free the in-flight handler
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after the in-flight handler finished")
+	}
+	if id := <-handled; id != "in-flight" {
+		t.Errorf("handler saw %q, want in-flight", id)
+	}
+	select { // drop-queued: "queued" must never have been delivered
+	case id := <-handled:
+		t.Fatalf("buffered record was delivered after cancel: %q", id)
+	default:
+	}
+}
