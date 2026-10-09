@@ -77,6 +77,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+/*
+newJobHandler builds the worker's per-record function: mark running,
+execute through V0's Runner seam, persist the outcome. It is V1's honesty
+rules moved off the request path — a failed run is data (status failed +
+error message), never an exception.
+
+A Save failure inside the worker has no client to answer and no logger
+yet (V9); the record simply stays at its last saved status, which is the
+most honest thing pre-observability Forge can say.
+*/
+func newJobHandler(st *store.Store, exec executor.Runner) func(store.Record) {
+	return func(rec store.Record) {
+		rec.Status = job.StatusRunning
+		if err := st.Save(rec); err != nil {
+			return
+		}
+
+		res, err := exec.Run(job.Job{ID: rec.ID, Command: rec.Command})
+		rec.Result = res
+		if err != nil {
+			rec.Status = job.StatusFailed
+			rec.Err = err.Error()
+		} else {
+			rec.Status = job.StatusSucceeded
+		}
+		_ = st.Save(rec)
+	}
+}
+
 // runServe parses serve flags, wires store + API into an http.Server, and
 // serves until ctx is cancelled. It returns an exit code rather than
 // calling os.Exit, keeping main the only place that terminates the process

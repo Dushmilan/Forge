@@ -3,12 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dushmilan/Forge/internal/executor"
+	"github.com/Dushmilan/Forge/internal/job"
+	"github.com/Dushmilan/Forge/internal/store"
 )
 
 // TestRunWithNoArgsPrintsUsage pins the CLI contract for a missing command:
@@ -146,5 +151,134 @@ func TestRunServeBadFlag(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := runServe(context.Background(), []string{"-bogus"}, &stdout, &stderr); code != 2 {
 		t.Errorf("runServe(-bogus) = %d, want 2", code)
+	}
+}
+
+// fakeRunner is V0's Runner seam doing what fakes do best: it signals when
+// a run starts and blocks until the test releases it, turning "did the
+// handler mark the job running?" into a channel question — no sleeps.
+type fakeRunner struct {
+	started chan struct{}
+	release chan struct{}
+	res     executor.Result
+	err     error
+}
+
+func (f *fakeRunner) Run(j job.Job) (executor.Result, error) {
+	f.started <- struct{}{}
+	<-f.release
+	return f.res, f.err
+}
+
+// TestJobHandlerRunsAndPersists pins the success path: pending in, running
+// saved on the way, succeeded with the executor's result out.
+func TestJobHandlerRunsAndPersists(t *testing.T) {
+	st := store.New(t.TempDir())
+	fake := &fakeRunner{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+		res:     executor.Result{ExitCode: 0, Stdout: "hello\n"},
+	}
+	fake.release <- struct{}{} // the single run proceeds immediately
+
+	pending := store.Record{ID: "j1", Command: []string{"echo", "hello"}, Status: job.StatusPending}
+	if err := st.Save(pending); err != nil {
+		t.Fatal(err)
+	}
+
+	newJobHandler(st, fake)(pending)
+
+	stored, err := st.Get("j1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", stored.Status)
+	}
+	if stored.Result.Stdout != "hello\n" {
+		t.Errorf("stdout = %q, want %q", stored.Result.Stdout, "hello\n")
+	}
+}
+
+// TestJobHandlerMarksRunningMidFlight pins Review Focus 3: while the
+// executor is busy, the stored record reads "running" — the live status a
+// GET would serve — not "pending" and not the final result.
+func TestJobHandlerMarksRunningMidFlight(t *testing.T) {
+	st := store.New(t.TempDir())
+	fake := &fakeRunner{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+	}
+	pending := store.Record{ID: "j1", Command: []string{"slow"}, Status: job.StatusPending}
+	if err := st.Save(pending); err != nil {
+		t.Fatal(err)
+	}
+
+	handlerDone := make(chan struct{})
+	go func() {
+		newJobHandler(st, fake)(pending)
+		close(handlerDone)
+	}()
+
+	select { // the executor has the job; the record must say running NOW
+	case <-fake.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executor never started")
+	}
+	stored, err := st.Get("j1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Status != job.StatusRunning {
+		t.Errorf("mid-flight status = %v, want running", stored.Status)
+	}
+
+	fake.release <- struct{}{}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never finished after release")
+	}
+	stored, err = st.Get("j1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Status != job.StatusSucceeded {
+		t.Errorf("final status = %v, want succeeded", stored.Status)
+	}
+}
+
+// TestJobHandlerRunFailureIsData pins V1's honesty rule on the worker path:
+// a failed run is an OUTCOME — status failed, message kept in the record's
+// error field — not an exception.
+func TestJobHandlerRunFailureIsData(t *testing.T) {
+	st := store.New(t.TempDir())
+	fake := &fakeRunner{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+		res:     executor.Result{ExitCode: 3},
+		err:     errors.New("exit status 3"),
+	}
+	fake.release <- struct{}{}
+
+	pending := store.Record{ID: "j1", Command: []string{"sh", "-c", "exit 3"}, Status: job.StatusPending}
+	if err := st.Save(pending); err != nil {
+		t.Fatal(err)
+	}
+
+	newJobHandler(st, fake)(pending)
+
+	stored, err := st.Get("j1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Status != job.StatusFailed {
+		t.Errorf("status = %v, want failed", stored.Status)
+	}
+	if stored.Result.ExitCode != 3 {
+		t.Errorf("exit code = %d, want 3", stored.Result.ExitCode)
+	}
+	if stored.Err != "exit status 3" {
+		t.Errorf("error field = %q, want the failure message as data", stored.Err)
 	}
 }
