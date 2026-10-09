@@ -16,3 +16,6 @@
 
 # Isolated worktrees
 /.worktrees/
+
+# Runtime job store (default -data directory)
+/data/
