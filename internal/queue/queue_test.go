@@ -204,3 +204,29 @@ func TestRunFinishesCurrentAndDropsQueued(t *testing.T) {
 	default:
 	}
 }
+
+// TestEnqueueAfterCancelWithFreeBufferReturnsError pins the deterministic
+// half of the no-deadlock guarantee the API's 503 relies on: with a CANCELLED
+// ctx, Enqueue must error even when the buffer has free space. Both select
+// cases are ready in that situation, and select chooses pseudo-randomly —
+// without an explicit priority check, a shutdown-race POST would slip into
+// the buffer ~half the time and get a 202 instead of a 503.
+func TestEnqueueAfterCancelWithFreeBufferReturnsError(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancel()
+
+	for i := 0; i < 20; i++ { // repeated: the bug this pins is a coin flip
+		errDone := make(chan error, 1)
+		go func() { errDone <- q.Enqueue(ctx, store.Record{ID: strconv.Itoa(i)}) }()
+		select {
+		case err := <-errDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Enqueue after cancel = %v, want wrapped context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Enqueue blocked after ctx cancel — shutdown deadlock")
+		}
+	}
+}

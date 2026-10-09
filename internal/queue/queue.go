@@ -39,8 +39,18 @@ backpressure. After cancellation the send case may never succeed (the
 receiver is gone), so the ctx case is what keeps a late POST from
 blocking http.Server.Shutdown forever. ctx.Err is wrapped so callers can
 still ask errors.Is(err, context.Canceled).
+
+Cancellation gets an explicit priority check first: with both cases ready
+(cancelled ctx, free buffer) select chooses pseudo-randomly, and a
+shutdown-race POST must NOT be able to slip into the buffer half the time
+— the API's 503 contract depends on this being deterministic.
 */
 func (q *Queue) Enqueue(ctx context.Context, rec store.Record) error {
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("queue: enqueue: %w", ctx.Err())
+	default:
+	}
 	select {
 	case q.jobs <- rec:
 		return nil
