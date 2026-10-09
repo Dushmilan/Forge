@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -187,7 +189,7 @@ func TestJobHandlerRunsAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newJobHandler(st, fake)(pending)
+	newJobHandler(st, fake, io.Discard)(pending)
 
 	stored, err := st.Get("j1")
 	if err != nil {
@@ -217,7 +219,7 @@ func TestJobHandlerMarksRunningMidFlight(t *testing.T) {
 
 	handlerDone := make(chan struct{})
 	go func() {
-		newJobHandler(st, fake)(pending)
+		newJobHandler(st, fake, io.Discard)(pending)
 		close(handlerDone)
 	}()
 
@@ -267,7 +269,7 @@ func TestJobHandlerRunFailureIsData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newJobHandler(st, fake)(pending)
+	newJobHandler(st, fake, io.Discard)(pending)
 
 	stored, err := st.Get("j1")
 	if err != nil {
@@ -281,6 +283,37 @@ func TestJobHandlerRunFailureIsData(t *testing.T) {
 	}
 	if stored.Err != "exit status 3" {
 		t.Errorf("error field = %q, want the failure message as data", stored.Err)
+	}
+}
+
+// TestJobHandlerSaveFailureGoesToStderr pins the spec's "never swallows"
+// rule on the worker path: a Save that fails has no client to answer and
+// no logger until V9, so the failure must at least land on stderr instead
+// of vanishing. A file where a directory should be makes Save fail
+// deterministically.
+func TestJobHandlerSaveFailureGoesToStderr(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New(filepath.Join(blocker, "data"))
+	fake := &fakeRunner{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+	}
+	fake.release <- struct{}{} // released, but the executor must NOT run: the running-save failed first
+	var stderr bytes.Buffer
+
+	pending := store.Record{ID: "j1", Command: []string{"true"}, Status: job.StatusPending}
+	newJobHandler(st, fake, &stderr)(pending)
+
+	if !strings.Contains(stderr.String(), "j1") {
+		t.Errorf("stderr = %q, want it to name the job whose save failed", stderr.String())
+	}
+	select {
+	case <-fake.started:
+		t.Fatal("executor ran even though marking the job running failed")
+	default:
 	}
 }
 
@@ -361,5 +394,103 @@ func TestRunServeRunsJobsInBackground(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runServe did not shut down after cancel")
+	}
+}
+
+// TestRunServeFinishesRunningJobOnShutdown pins the spec's shutdown
+// contract end to end (Review Focus 2): ctx cancellation while a job is
+// RUNNING must not let runServe return until that job has finished and its
+// final status is on disk. Without a worker join, runServe returns in
+// milliseconds and the record is stuck "running" forever.
+func TestRunServeFinishesRunningJobOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	data := t.TempDir()
+	out := newLineWriter()
+	code := make(chan int, 1)
+	go func() {
+		code <- runServe(ctx, []string{"-addr", "127.0.0.1:0", "-data", data}, out, io.Discard)
+	}()
+
+	var addr string
+	select {
+	case line := <-out.ch:
+		addr = strings.TrimPrefix(line, "listening on ")
+		if addr == line {
+			t.Fatalf("unexpected startup line %q", line)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe never printed its listening address")
+	}
+
+	resp, err := http.Post("http://"+addr+"/jobs", "application/json",
+		strings.NewReader(`{"command": ["sleep", "1"]}`))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	var rec store.Record
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("POST body is not JSON: %v", err)
+	}
+	resp.Body.Close()
+
+	// Wait until the record reads "running" — the job is genuinely
+	// mid-flight when we cancel, which is the whole point of this test.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, err := http.Get("http://" + addr + "/jobs/" + rec.ID)
+		if err != nil {
+			t.Fatalf("GET failed: %v", err)
+		}
+		var got store.Record
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			r.Body.Close()
+			t.Fatalf("GET body is not JSON: %v", err)
+		}
+		r.Body.Close()
+		if got.Status == job.StatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job never reached running; last status %v", got.Status)
+		}
+		time.Sleep(time.Millisecond) // poll interval only; the deadline is the guarantee
+	}
+
+	cancel() // Ctrl-C while the job is running
+
+	// Without the worker join, runServe returns almost immediately — that
+	// premature return is the bug this test pins.
+	select {
+	case c := <-code:
+		t.Fatalf("runServe returned %d while the job was still mid-flight", c)
+	case <-time.After(200 * time.Millisecond):
+		// good: runServe is waiting for the in-flight job
+	}
+
+	select { // ...and now it must return, because the job will finish
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0 on clean shutdown", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe never returned after the in-flight job finished")
+	}
+
+	b, err := os.ReadFile(filepath.Join(data, "jobs.json"))
+	if err != nil {
+		t.Fatalf("read store file: %v", err)
+	}
+	var m map[string]store.Record
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode store file: %v", err)
+	}
+	stored, ok := m[rec.ID]
+	if !ok {
+		t.Fatal("record vanished from the store")
+	}
+	if stored.Status != job.StatusSucceeded {
+		t.Errorf("final status = %v, want succeeded — the job must complete before shutdown returns", stored.Status)
 	}
 }

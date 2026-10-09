@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +25,7 @@ func newServer(t *testing.T) (*api.Server, *store.Store, *queue.Queue) {
 	t.Helper()
 	st := store.New(t.TempDir())
 	q := queue.New()
-	return api.New(q, st), st, q
+	return api.New(context.Background(), q, st), st, q
 }
 
 // TestGetJobFound pins the happy path: 200, JSON content type, and a body
@@ -192,7 +193,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := queue.New()
-	srv := api.New(q, store.New(filepath.Join(blocker, "data")))
+	srv := api.New(context.Background(), q, store.New(filepath.Join(blocker, "data")))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
@@ -219,14 +220,16 @@ func TestPostJobStoreFailure500(t *testing.T) {
 	}
 }
 
-// TestPostJobShutdown503 pins Review Focus 1: a POST whose request context
-// is already dead (server shutting down) gets 503 + JSON error instead of
-// blocking forever, and the pending record it saved stays pending —
-// nothing is enqueued.
-func TestPostJobShutdown503(t *testing.T) {
+// TestPostJobCancelledRequest503 pins the client-disconnect half of the
+// no-deadlock guarantee: a POST whose REQUEST context is already dead gets
+// 503 + JSON error instead of blocking forever, and the pending record it
+// saved stays pending — nothing is enqueued. (The server-shutdown half has
+// its own test below: http.Server.Shutdown does NOT cancel request
+// contexts, so the two cancellations are genuinely different things.)
+func TestPostJobCancelledRequest503(t *testing.T) {
 	dir := t.TempDir()
 	q := queue.New()
-	srv := api.New(q, store.New(dir))
+	srv := api.New(context.Background(), q, store.New(dir))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // as if the server were already shutting down
@@ -272,6 +275,54 @@ func TestPostJobShutdown503(t *testing.T) {
 	case got := <-seen:
 		t.Fatalf("the 503'd record reached the worker: %+v", got)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestPostBlockedEnqueueGets503OnServerShutdown pins Review Focus 1 for a
+// REAL server shutdown: http.Server.Shutdown does not cancel request
+// contexts, so a POST blocked on a full queue must be released by the
+// server's lifecycle context, or it hangs until the Shutdown deadline and
+// gets its connection dropped instead of an answer.
+func TestPostBlockedEnqueueGets503OnServerShutdown(t *testing.T) {
+	st := store.New(t.TempDir())
+	q := queue.New()
+	sctx, scancel := context.WithCancel(context.Background())
+	srv := api.New(sctx, q, st)
+
+	gate := make(chan struct{})
+	defer close(gate) // frees the worker's handler on the way out
+	wctx, wcancel := context.WithCancel(context.Background())
+	defer wcancel()
+	go q.Run(wctx, func(store.Record) { <-gate }) // the worker takes one job and holds it
+
+	for i := 0; i < queue.Capacity+1; i++ { // fill: one held + a full buffer
+		if err := q.Enqueue(wctx, store.Record{ID: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("fill Enqueue(%d): %v", i, err)
+		}
+	}
+
+	resp := make(chan *httptest.ResponseRecorder, 1)
+	go func() { // this POST blocks in Enqueue: the queue is full
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/jobs",
+			strings.NewReader(`{"command": ["true"]}`))
+		srv.Handler().ServeHTTP(rec, req)
+		resp <- rec
+	}()
+
+	scancel() // the server shuts down while that POST is blocked
+
+	select {
+	case rec := <-resp:
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Errorf("body is not JSON: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked POST never got its 503 after server shutdown")
 	}
 }
 

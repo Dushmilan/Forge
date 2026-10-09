@@ -9,6 +9,7 @@ never touches os/exec.
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -22,22 +23,29 @@ import (
 )
 
 /*
-Server is the HTTP front end. It holds only the two collaborators every
-handler needs: the queue jobs are handed to, and the store their records
-live in. It never runs anything — V2 moved execution to the worker.
+Server is the HTTP front end. It holds only the collaborators every
+handler needs: the queue jobs are handed to, the store their records
+live in, and the server's lifecycle context. It never runs anything —
+V2 moved execution to the worker.
 */
 type Server struct {
-	q  *queue.Queue
-	st *store.Store
+	q   *queue.Queue
+	st  *store.Store
+	ctx context.Context
 }
 
 /*
 New wires the server. The queue is V2's seam: POST enqueues, the worker
 dequeues, and this package cannot tell the difference between a live
 worker and a test's — which is exactly why the tests need no executor.
+
+ctx is the SERVER's lifecycle context (cancelled when the server shuts
+down). It is not a request's context: http.Server.Shutdown waits for
+active requests but never cancels them, so Enqueue needs both signals —
+see createJob.
 */
-func New(q *queue.Queue, st *store.Store) *Server {
-	return &Server{q: q, st: st}
+func New(ctx context.Context, q *queue.Queue, st *store.Store) *Server {
+	return &Server{q: q, st: st, ctx: ctx}
 }
 
 // Handler returns the routes on a Go 1.22 method+pattern mux: the verb is
@@ -124,11 +132,18 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 5: hand off to the worker. Enqueue selects on r.Context(): when
-	// the server is shutting down and the worker may already be gone, a
-	// send could block forever — cancellation turns the hand-off into an
-	// honest 503 instead of a hung request.
-	if err := s.q.Enqueue(r.Context(), rec); err != nil {
+	// Step 5: hand off to the worker. Enqueue must respect TWO lifetimes:
+	// r.Context() ends when the request does (client disconnect), and the
+	// server's lifecycle context ends at shutdown — Shutdown does NOT
+	// cancel request contexts, so without the merge a POST blocked on a
+	// full queue would hang until the Shutdown deadline and then get its
+	// connection dropped instead of an answer. context.AfterFunc (Go 1.21)
+	// bridges the second signal into the first: one cancel, two causes.
+	ectx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	if err := s.q.Enqueue(ectx, rec); err != nil {
 		writeErr(w, http.StatusServiceUnavailable, err)
 		return
 	}

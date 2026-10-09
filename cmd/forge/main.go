@@ -85,13 +85,14 @@ rules moved off the request path — a failed run is data (status failed +
 error message), never an exception.
 
 A Save failure inside the worker has no client to answer and no logger
-yet (V9); the record simply stays at its last saved status, which is the
-most honest thing pre-observability Forge can say.
+yet (V9); stderr is the most honest destination pre-observability Forge
+has — the spec's "never swallows it" rule, at the only volume available.
 */
-func newJobHandler(st *store.Store, exec executor.Runner) func(store.Record) {
+func newJobHandler(st *store.Store, exec executor.Runner, stderr io.Writer) func(store.Record) {
 	return func(rec store.Record) {
 		rec.Status = job.StatusRunning
 		if err := st.Save(rec); err != nil {
+			fmt.Fprintf(stderr, "forge: save job %s: %v\n", rec.ID, err)
 			return
 		}
 
@@ -103,7 +104,9 @@ func newJobHandler(st *store.Store, exec executor.Runner) func(store.Record) {
 		} else {
 			rec.Status = job.StatusSucceeded
 		}
-		_ = st.Save(rec)
+		if err := st.Save(rec); err != nil {
+			fmt.Fprintf(stderr, "forge: save job %s: %v\n", rec.ID, err)
+		}
 	}
 }
 
@@ -131,10 +134,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		accepting requests also stops the worker loop. The worker finishes
 		the job it holds and drops the rest — no drain, no sleep.
 	*/
-	go q.Run(ctx, newJobHandler(st, e))
+	workerDone := make(chan struct{})
+	go func() {
+		q.Run(ctx, newJobHandler(st, e, stderr))
+		close(workerDone) // closing (not just returning) lets the shutdown path JOIN
+	}()
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.New(q, st).Handler(),
+		Handler: api.New(ctx, q, st).Handler(),
 	}
 
 	// Listen ourselves instead of srv.ListenAndServe() so we can print the
@@ -167,6 +174,22 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		// Shutdown) both mean "we meant to stop" — not a failure.
 		_ = ln.Close()
 		<-serveErr // join: don't return until the serving goroutine has
+		/*
+			Restore default signal handling BEFORE joining the worker: the
+			join below can take as long as the in-flight job runs, and the
+			user must still be able to force-quit with a second Ctrl-C.
+			(Not unit-tested: signal.Reset's effect is "kill the process",
+			which no in-process test can observe without dying.)
+		*/
+		signal.Reset(os.Interrupt, syscall.SIGTERM)
+		/*
+			Join the worker. The spec's shutdown contract — a running job
+			COMPLETES before we return — is only true because we wait here:
+			main calls os.Exit right after runServe, which would kill the
+			worker goroutine mid-handler. Queue.Run returns only after its
+			current handler has finished, so this channel is that guarantee.
+		*/
+		<-workerDone
 		return 0
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
