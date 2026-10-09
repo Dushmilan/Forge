@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,26 +10,27 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Dushmilan/Forge/internal/api"
-	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
+	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
-// newServer builds a Server over a temp-dir store. executor.Runner is V0's
-// seam — the API never names the concrete Executor, which is exactly why it
-// exists.
-func newServer(t *testing.T) (*api.Server, *store.Store) {
+// newServer builds a Server over a temp-dir store and a fresh queue. No
+// executor: as of V2 the API hands jobs off, it never runs them.
+func newServer(t *testing.T) (*api.Server, *store.Store, *queue.Queue) {
 	t.Helper()
 	st := store.New(t.TempDir())
-	return api.New(executor.Executor{}, st), st
+	q := queue.New()
+	return api.New(q, st), st, q
 }
 
 // TestGetJobFound pins the happy path: 200, JSON content type, and a body
 // whose id matches the path.
 func TestGetJobFound(t *testing.T) {
-	srv, st := newServer(t)
+	srv, st, _ := newServer(t)
 	if err := st.Save(store.Record{ID: "job1", Command: []string{"true"}, Status: job.StatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func TestGetJobFound(t *testing.T) {
 // TestGetJobMissing pins the 404 contract: JSON error body carrying the
 // id, so a client can tell WHICH job was missing.
 func TestGetJobMissing(t *testing.T) {
-	srv, _ := newServer(t)
+	srv, _, _ := newServer(t)
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/jobs/ghost", nil))
@@ -77,7 +79,7 @@ func TestGetJobMissing(t *testing.T) {
 // (Review Focus 3): 405 for a known path with the wrong verb, 404 for an
 // unknown path. Pinned so nobody later "fixes" these into 200s.
 func TestMethodAndPathFallbacks(t *testing.T) {
-	srv, _ := newServer(t)
+	srv, _, _ := newServer(t)
 	h := srv.Handler()
 
 	tests := []struct {
@@ -99,20 +101,19 @@ func TestMethodAndPathFallbacks(t *testing.T) {
 	}
 }
 
-// TestPostJobRunsAndPersists pins the V1 core: a valid submission runs
-// synchronously, answers 201 with the full record, and that record is
-// retrievable afterwards — the response body and the stored record are the
-// same job.
-func TestPostJobRunsAndPersists(t *testing.T) {
-	srv, st := newServer(t)
+// TestPostJobEnqueuesAndPersists pins the V2 headline: POST answers 202
+// with the PENDING record, that record is persisted BEFORE the response,
+// and it reaches a worker — the request itself never waits for the run.
+func TestPostJobEnqueuesAndPersists(t *testing.T) {
+	srv, st, q := newServer(t)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
 		strings.NewReader(`{"command": ["echo", "hello"]}`))
 	srv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
 	}
 	var body store.Record
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -121,19 +122,30 @@ func TestPostJobRunsAndPersists(t *testing.T) {
 	if body.ID == "" {
 		t.Fatal("response has no id — the server must generate one")
 	}
-	if body.Status != job.StatusSucceeded {
-		t.Errorf("status = %v, want succeeded", body.Status)
-	}
-	if body.Result.Stdout != "hello\n" {
-		t.Errorf("stdout = %q, want %q", body.Result.Stdout, "hello\n")
+	if body.Status != job.StatusPending {
+		t.Errorf("status = %v, want pending", body.Status)
 	}
 
 	stored, err := st.Get(body.ID)
 	if err != nil {
 		t.Fatalf("persisted record not found: %v", err)
 	}
-	if stored.ID != body.ID || stored.Result.Stdout != body.Result.Stdout {
-		t.Errorf("stored = %+v, want to match response %+v", stored, body)
+	if stored.Status != job.StatusPending {
+		t.Errorf("stored status = %v, want pending", stored.Status)
+	}
+
+	// The record reached the queue: a worker started now receives it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan store.Record, 1)
+	go q.Run(ctx, func(r store.Record) { seen <- r })
+	select {
+	case got := <-seen:
+		if got.ID != body.ID {
+			t.Errorf("worker saw id %q, want %q", got.ID, body.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueued record never reached a worker")
 	}
 }
 
@@ -153,7 +165,7 @@ func TestPostJobRejections(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, _ := newServer(t)
+			srv, _, _ := newServer(t)
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(tt.body))
@@ -170,57 +182,17 @@ func TestPostJobRejections(t *testing.T) {
 	}
 }
 
-// TestPostJobFailedCommand pins Review Focus 2: a command that exits
-// non-zero (or never starts) is a 201 with status "failed" and the error
-// preserved as data — not a 400, not a 500.
-func TestPostJobFailedCommand(t *testing.T) {
-	tests := []struct {
-		name     string
-		command  string
-		wantCode int
-	}{
-		{name: "exits 3", command: `["sh", "-c", "exit 3"]`, wantCode: 3},
-		{name: "binary missing", command: `["definitely-not-a-real-binary-xyz"]`, wantCode: 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv, _ := newServer(t)
-
-			rec := httptest.NewRecorder()
-			body := `{"command": ` + tt.command + `}`
-			req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
-			srv.Handler().ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusCreated {
-				t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
-			}
-			var got store.Record
-			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-				t.Fatalf("body is not JSON: %v", err)
-			}
-			if got.Status != job.StatusFailed {
-				t.Errorf("status = %v, want failed", got.Status)
-			}
-			if got.Result.ExitCode != tt.wantCode {
-				t.Errorf("exit code = %d, want %d", got.Result.ExitCode, tt.wantCode)
-			}
-			if got.Err == "" {
-				t.Error("error field empty — the failure message must persist as data")
-			}
-		})
-	}
-}
-
-// TestPostJobStoreFailure500 pins the spec's 500 rule: when the job ran but
-// the store rejects it, the client learns the save failed instead of
-// hearing nothing. A file where a directory should be makes MkdirAll (and
-// thus Save) fail deterministically — no fault injection needed.
+// TestPostJobStoreFailure500 pins Review Focus 5: a store that cannot
+// save gets 500, and the submission never reaches the queue — a 500'd
+// POST must not secretly run the job anyway. A file where a directory
+// should be makes MkdirAll (and thus Save) fail deterministically.
 func TestPostJobStoreFailure500(t *testing.T) {
 	blocker := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := api.New(executor.Executor{}, store.New(filepath.Join(blocker, "data")))
+	q := queue.New()
+	srv := api.New(q, store.New(filepath.Join(blocker, "data")))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
@@ -234,6 +206,73 @@ func TestPostJobStoreFailure500(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Errorf("body is not JSON: %v", err)
 	}
+
+	// Nothing was enqueued: a worker started now must see an empty queue.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan store.Record, 1)
+	go q.Run(ctx, func(r store.Record) { seen <- r })
+	select {
+	case got := <-seen:
+		t.Fatalf("a 500'd submission reached the worker: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestPostJobShutdown503 pins Review Focus 1: a POST whose request context
+// is already dead (server shutting down) gets 503 + JSON error instead of
+// blocking forever, and the pending record it saved stays pending —
+// nothing is enqueued.
+func TestPostJobShutdown503(t *testing.T) {
+	dir := t.TempDir()
+	q := queue.New()
+	srv := api.New(q, store.New(dir))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // as if the server were already shutting down
+	req := httptest.NewRequest(http.MethodPost, "/jobs",
+		strings.NewReader(`{"command": ["echo", "late"]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+
+	// The saved record is the only one, and it stayed pending. Read the
+	// store file directly — the store has no List, and inventing one for
+	// a test is V-something-else's problem.
+	b, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatalf("read store file: %v", err)
+	}
+	var m map[string]store.Record
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode store file: %v", err)
+	}
+	if len(m) != 1 {
+		t.Fatalf("stored %d records, want exactly the one pending save", len(m))
+	}
+	for _, got := range m {
+		if got.Status != job.StatusPending {
+			t.Errorf("record status = %v, want pending", got.Status)
+		}
+	}
+
+	// And it was never handed off: a worker now sees an empty queue.
+	wctx, wcancel := context.WithCancel(context.Background())
+	defer wcancel()
+	seen := make(chan store.Record, 1)
+	go q.Run(wctx, func(r store.Record) { seen <- r })
+	select {
+	case got := <-seen:
+		t.Fatalf("the 503'd record reached the worker: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 // TestConcurrentRequestsRaceFree pins Review Focus 4 at the API level: a
@@ -241,7 +280,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 // a known id. If the store mutex were missing, -race would fire here —
 // net/http serves every request on its own goroutine by design.
 func TestConcurrentRequestsRaceFree(t *testing.T) {
-	srv, st := newServer(t)
+	srv, st, _ := newServer(t)
 	if err := st.Save(store.Record{ID: "hot", Command: []string{"true"}, Status: job.StatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}

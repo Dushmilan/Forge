@@ -18,6 +18,7 @@ import (
 	"github.com/Dushmilan/Forge/internal/api"
 	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
+	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
@@ -123,9 +124,17 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 
 	var e executor.Executor
+	st := store.New(*data)
+	q := queue.New()
+	/*
+		One context governs server AND worker: the same signal that stops
+		accepting requests also stops the worker loop. The worker finishes
+		the job it holds and drops the rest — no drain, no sleep.
+	*/
+	go q.Run(ctx, newJobHandler(st, e))
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.New(e, store.New(*data)).Handler(),
+		Handler: api.New(q, st).Handler(),
 	}
 
 	// Listen ourselves instead of srv.ListenAndServe() so we can print the

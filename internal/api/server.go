@@ -1,9 +1,10 @@
 /*
 Package api exposes Forge over HTTP: submit a job, fetch a job.
 
-Handlers are synchronous — POST runs the job before responding. That is
-V1's honest shape; V2 replaces the inline run with a queue, and this
-package's interface does not change.
+Handlers never run jobs — POST saves a pending record, hands it to the
+queue, and answers 202 immediately; the worker goroutine started by
+cmd/forge does the running. The request path stays fast and this package
+never touches os/exec.
 */
 package api
 
@@ -15,24 +16,28 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
+	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
-// Server is the HTTP front end. It holds only the two collaborators every
-// handler needs; config (timeouts, sandboxes) arrives in later versions
-// without changing New's callers.
+/*
+Server is the HTTP front end. It holds only the two collaborators every
+handler needs: the queue jobs are handed to, and the store their records
+live in. It never runs anything — V2 moved execution to the worker.
+*/
 type Server struct {
-	exec executor.Runner
-	st   *store.Store
+	q  *queue.Queue
+	st *store.Store
 }
 
-// New wires the server. exec is V0's Runner interface, not the concrete
-// Executor — accept interfaces, return concrete types, and tests (or V2's
-// queue) can substitute whatever has a Run method.
-func New(exec executor.Runner, st *store.Store) *Server {
-	return &Server{exec: exec, st: st}
+/*
+New wires the server. The queue is V2's seam: POST enqueues, the worker
+dequeues, and this package cannot tell the difference between a live
+worker and a test's — which is exactly why the tests need no executor.
+*/
+func New(q *queue.Queue, st *store.Store) *Server {
+	return &Server{q: q, st: st}
 }
 
 // Handler returns the routes on a Go 1.22 method+pattern mux: the verb is
@@ -75,9 +80,10 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
-// createJob is the V1 core: decode → identify → validate → run → persist →
-// respond, in that order, all inside one HTTP request. Each step answers
-// with the status code its failure actually deserves.
+// createJob is the V2 core: decode → identify → validate → persist pending
+// → enqueue → 202, in that order, all inside one HTTP request. Each step
+// answers with the status code its failure actually deserves. The job
+// itself runs later, on the worker — this handler never blocks on it.
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -109,24 +115,25 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: run it. Blocking here IS V1 — the client waits because there
-	// is no queue yet. V2's whole point is that this line stops blocking.
-	res, runErr := s.exec.Run(j)
-
-	// Step 5: a command that failed is an OUTCOME, not a transport error.
-	// The job ran; the answer is 201 with status "failed" and the message
-	// kept as data. Only a broken store justifies 500.
-	rec := store.Record{ID: id, Command: j.Command, Status: job.StatusSucceeded, Result: res}
-	if runErr != nil {
-		rec.Status = job.StatusFailed
-		rec.Err = runErr.Error()
-	}
+	// Step 4: persist the job's intent BEFORE answering. A pending record
+	// on disk is what makes 202 honest: even if the process dies before
+	// the worker picks the job up, the submission is not lost.
+	rec := store.Record{ID: id, Command: in.Command, Status: job.StatusPending}
 	if err := s.st.Save(rec); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
+	// Step 5: hand off to the worker. Enqueue selects on r.Context(): when
+	// the server is shutting down and the worker may already be gone, a
+	// send could block forever — cancellation turns the hand-off into an
+	// honest 503 instead of a hung request.
+	if err := s.q.Enqueue(r.Context(), rec); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(rec)
 }
 
