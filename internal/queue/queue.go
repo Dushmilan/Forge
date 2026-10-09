@@ -11,6 +11,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Dushmilan/Forge/internal/store"
 )
@@ -31,11 +32,21 @@ func New() *Queue {
 	return &Queue{jobs: make(chan store.Record, Capacity)}
 }
 
-// Enqueue blocks until the queue has room: a full buffer makes the caller
-// wait. That is backpressure — overload flows to whoever is submitting the
-// job, and memory stays bounded by Capacity.
-func (q *Queue) Enqueue(rec store.Record) {
-	q.jobs <- rec
+/*
+Enqueue hands rec to the worker via select over two cases: the send, and
+ctx.Done(). While the worker lives, a full buffer makes the caller wait —
+backpressure. After cancellation the send case may never succeed (the
+receiver is gone), so the ctx case is what keeps a late POST from
+blocking http.Server.Shutdown forever. ctx.Err is wrapped so callers can
+still ask errors.Is(err, context.Canceled).
+*/
+func (q *Queue) Enqueue(ctx context.Context, rec store.Record) error {
+	select {
+	case q.jobs <- rec:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("queue: enqueue: %w", ctx.Err())
+	}
 }
 
 // Run drains the queue on the goroutine it is started on — callers must
