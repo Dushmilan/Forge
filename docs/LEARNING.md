@@ -54,3 +54,26 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V2 — Queue + worker
+
+- **Concept:**
+  - A buffered `chan` IS a thread-safe FIFO queue — the "queue + mutex +
+    condition variable" reflex is the pre-Go design; the channel replaces
+    all three.
+  - The worker loop: `for { select { case <-ctx.Done(): return; case rec := <-ch: handle(rec) } }` —
+    one goroutine, two wakeup reasons, no polling.
+  - Blocking channel sends as backpressure, and putting the send *inside*
+    a `select` with `ctx.Done()` so an enqueue can't deadlock shutdown.
+  - `select` chooses pseudo-randomly between simultaneously-ready cases —
+    so "cancellation wins over delivery" needs an explicit re-check, it is
+    not the default.
+  - Testing goroutines honestly: gates (channels the handler waits on) and
+    deadlines instead of `time.Sleep`.
+- **What I built:** `internal/queue` (channel + single-goroutine loop), an
+  async API (`POST /jobs` answers 202 with a pending record; `GET` observes
+  `pending → running → final` live), and `forge serve` wiring one context
+  through both server and worker.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_

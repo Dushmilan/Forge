@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0 and V1 are done. V2–V11 are planned.
+**Status:** V0–V2 are done. V3–V11 are planned.
 
 ## Quick start
 
@@ -28,12 +28,14 @@ go build ./cmd/forge
 ```
 
 ```sh
-curl -X POST localhost:8080/jobs -d '{"command": ["echo", "hello"]}'   # 201 + record
-curl localhost:8080/jobs/<id>                                          # 200 + record
+curl -X POST localhost:8080/jobs -d '{"command": ["echo", "hello"]}'   # 202 + pending record
+curl localhost:8080/jobs/<id>                                          # 200 + record (poll for final status)
 ```
 
-Jobs run synchronously: the POST response arrives when the command finishes,
-and every submitted job is persisted to `<data>/jobs.json` for later `GET`s.
+Jobs run asynchronously (V2): the POST returns 202 with a `pending` record
+as soon as it is queued, one worker goroutine runs it, and `GET` shows the
+record moving `pending → running → succeeded|failed`. Every submitted job
+is persisted to `<data>/jobs.json`.
 
 Run the tests:
 
@@ -79,13 +81,30 @@ GET /jobs/{id} ──────────────▶ store.Get ───
 - [`internal/api`](internal/api) — handlers on Go 1.22's method+pattern
   mux; errors are always JSON (`{"error": "…"}`).
 
+## How it works (V2)
+
+V2 moves execution off the request path. The API's only job is to persist
+and enqueue; one worker goroutine drains the queue:
+
+```
+POST /jobs ──▶ api.Server ──▶ store.Save (pending) ──▶ queue.Enqueue ──▶ 202
+                                    ▲                       │
+                 worker goroutine: running ─▶ Runner ─▶ final Save
+                                    └──── queue.Run(ctx, handler)
+```
+
+- [`internal/queue`](internal/queue) — a buffered channel (capacity 64) and
+  a one-goroutine `select` loop; a full queue blocks the sender
+  (backpressure), and cancellation ends the loop without a shutdown
+  deadlock.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
 |-----|--------------------------------|--------------------------------------------------|--------|
 | V0  | Single-process executor        | structs, interfaces, error handling, `testing`   | ✅     |
 | V1  | API + persistent jobs          | `net/http`, handlers, JSON, file/SQL persistence | ✅     |
-| V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ⏳     |
+| V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ✅     |
 | V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ⏳     |
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ⏳     |
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ⏳     |
@@ -110,7 +129,8 @@ Forge/
 │   ├── job/               # Job, Status, validation, JSON marshaling
 │   ├── executor/          # synchronous command execution
 │   ├── store/             # JSON file persistence (V1)
-│   └── api/               # HTTP handlers (V1)
+│   ├── queue/             # channel + worker loop (V2)
+│   └── api/               # HTTP handlers (V1, async since V2)
 └── docs/
     ├── LEARNING.md        # one entry per version: what Go concept clicked
     └── versions/V0.md …   # spec for each version
