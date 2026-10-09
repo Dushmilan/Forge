@@ -22,24 +22,32 @@ import (
 )
 
 func main() {
-	// main is the only place allowed to call os.Exit; everything testable lives
-	// in run, which returns the exit code instead.
+	/**
+	main is the only place allowed to call os.Exit; everything testable lives
+	in run, which returns the exit code instead.
+	**/
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run builds a Job from the command-line arguments, executes it, writes the
-// captured output, and returns the process exit code. Taking io.Writer instead
-// of *os.File is another implicit interface: os.Stdout and a bytes.Buffer both
-// satisfy io.Writer, so tests can capture output without touching the real
-// terminal.
+/*
+run builds a Job from the command-line arguments, executes it, writes the
+captured output, and returns the process exit code. Taking io.Writer instead
+of *os.File is another implicit interface: os.Stdout and a bytes.Buffer both
+satisfy io.Writer, so tests can capture output without touching the real
+terminal.
+*/
 func run(args []string, stdout, stderr io.Writer) int {
-	// The serve subcommand is recognized by name BEFORE the args are
-	// treated as a job command, so `forge serve` starts a server instead of
-	// trying to execute a program named "serve".
+	/*
+		The serve subcommand is recognized by name BEFORE the args are
+		treated as a job command, so `forge serve` starts a server instead of
+		trying to execute a program named "serve".
+	*/
 	if len(args) > 0 && args[0] == "serve" {
-		// signal.NotifyContext translates OS signals (Ctrl-C, SIGTERM) into
-		// ctx cancellation — context is the one knob every blocking call in
-		// Go already understands.
+		/*
+			signal.NotifyContext translates OS signals (Ctrl-C, SIGTERM) into
+			ctx cancellation — context is the one knob every blocking call in
+			Go already understands.
+		*/
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop() // stop deregisters the signal handlers on the way out
 		return runServe(ctx, args[1:], stdout, stderr)

@@ -16,7 +16,7 @@
 1. Follow the ladder in order. Never pull a later version's concept forward.
 2. TDD always — no implementation line without a failing test that demanded it.
 3. The agent writes the code. The learner reads, runs, and asks questions.
-4. Every non-obvious line carries a comment explaining *the Go concept*, not syntax.
+4. Every non-obvious line carries a comment explaining *the Go concept*, not syntax with /**/ commenting convention.
 5. No abstraction before a version needs it (YAGNI).
 6. A version is done only when tests pass, `-race` is clean, `go vet` is clean,
    and `docs/LEARNING.md` has an entry.

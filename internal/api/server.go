@@ -1,8 +1,10 @@
-// Package api exposes Forge over HTTP: submit a job, fetch a job.
-//
-// Handlers are synchronous — POST runs the job before responding. That is
-// V1's honest shape; V2 replaces the inline run with a queue, and this
-// package's interface does not change.
+/*
+Package api exposes Forge over HTTP: submit a job, fetch a job.
+
+Handlers are synchronous — POST runs the job before responding. That is
+V1's honest shape; V2 replaces the inline run with a queue, and this
+package's interface does not change.
+*/
 package api
 
 import (
