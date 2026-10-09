@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -280,5 +281,85 @@ func TestJobHandlerRunFailureIsData(t *testing.T) {
 	}
 	if stored.Err != "exit status 3" {
 		t.Errorf("error field = %q, want the failure message as data", stored.Err)
+	}
+}
+
+// TestRunServeRunsJobsInBackground pins the V2 headline end to end: a real
+// POST answers 202 without waiting, and the record reaches a terminal
+// status on its own. The GET poll is deadline-bounded observation, not a
+// guessed sleep: it cannot flake on timing, only bound the wait — and it
+// reads the same status field a client would.
+func TestRunServeRunsJobsInBackground(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := newLineWriter()
+	code := make(chan int, 1)
+	go func() {
+		code <- runServe(ctx, []string{"-addr", "127.0.0.1:0", "-data", t.TempDir()}, out, io.Discard)
+	}()
+
+	var addr string
+	select {
+	case line := <-out.ch:
+		addr = strings.TrimPrefix(line, "listening on ")
+		if addr == line {
+			t.Fatalf("unexpected startup line %q", line)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe never printed its listening address")
+	}
+
+	resp, err := http.Post("http://"+addr+"/jobs", "application/json",
+		strings.NewReader(`{"command": ["echo", "hello"]}`))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", resp.StatusCode)
+	}
+	var rec store.Record
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("POST body is not JSON: %v", err)
+	}
+	resp.Body.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, err := http.Get("http://" + addr + "/jobs/" + rec.ID)
+		if err != nil {
+			t.Fatalf("GET failed: %v", err)
+		}
+		var got store.Record
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			r.Body.Close()
+			t.Fatalf("GET body is not JSON: %v", err)
+		}
+		r.Body.Close()
+		switch got.Status {
+		case job.StatusSucceeded:
+			if got.Result.Stdout != "hello\n" {
+				t.Errorf("stdout = %q, want %q", got.Result.Stdout, "hello\n")
+			}
+		case job.StatusFailed:
+			t.Fatalf("job failed: %+v", got)
+		default:
+			if time.Now().After(deadline) {
+				t.Fatalf("job never finished; last status %v", got.Status)
+			}
+			time.Sleep(time.Millisecond) // poll interval only; the deadline is the guarantee
+			continue
+		}
+		break
+	}
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0 on clean shutdown", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down after cancel")
 	}
 }
