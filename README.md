@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V2 are done. V3–V11 are planned.
+**Status:** V0–V3 are done. V4–V11 are planned.
 
 ## Quick start
 
@@ -24,7 +24,7 @@ any other Unix tool. Called with no arguments it prints usage and exits 2.
 
 ```sh
 go build ./cmd/forge
-./forge serve -addr :8080 -data ./data
+./forge serve -addr :8080 -data ./data -workers 4
 ```
 
 ```sh
@@ -33,9 +33,11 @@ curl localhost:8080/jobs/<id>                                          # 200 + r
 ```
 
 Jobs run asynchronously (V2): the POST returns 202 with a `pending` record
-as soon as it is queued, one worker goroutine runs it, and `GET` shows the
-record moving `pending → running → succeeded|failed`. Every submitted job
-is persisted to `<data>/jobs.json`.
+as soon as it is queued, and `GET` shows the record moving
+`pending → running → succeeded|failed` as a worker runs it. As of V3 a pool
+of worker goroutines (`-workers`, default 4) drains the queue
+concurrently, so a slow job no longer blocks the ones behind it. Every
+submitted job is persisted to `<data>/jobs.json`.
 
 Run the tests:
 
@@ -98,6 +100,27 @@ POST /jobs ──▶ api.Server ──▶ store.Save (pending) ──▶ queue.E
   (backpressure), and cancellation ends the loop without a shutdown
   deadlock.
 
+## How it works (V3)
+
+V3 turns that one worker into a pool. `-workers N` starts `N` goroutines
+that all receive from the same channel: a Go channel hands each record to
+exactly one receiver, so the workers compete for jobs with no extra lock.
+`sync.WaitGroup` makes `Run` block until the last in-flight worker finishes,
+so Ctrl-C still lets running jobs complete:
+
+```
+POST /jobs ──▶ api.Server ──▶ queue.Enqueue ──▶ ┌─ worker 1 ─┐
+                                               ├─ worker 2 ─┤──▶ handler
+                                               └─ worker N ─┘
+                 queue.Run(ctx, workers, handler) ──▶ wg.Wait() on shutdown
+```
+
+- [`internal/queue`](internal/queue) — `Run(ctx, workers, handler)` fans out
+  `N` goroutines over the channel and joins them with a `sync.WaitGroup`.
+- [`cmd/forge`](cmd/forge) — `serve -workers N` (default 4); `newJobHandler`
+  serializes its `stderr` error writes so concurrent workers stay
+  `-race` clean.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
@@ -105,7 +128,7 @@ POST /jobs ──▶ api.Server ──▶ store.Save (pending) ──▶ queue.E
 | V0  | Single-process executor        | structs, interfaces, error handling, `testing`   | ✅     |
 | V1  | API + persistent jobs          | `net/http`, handlers, JSON, file/SQL persistence | ✅     |
 | V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ✅     |
-| V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ⏳     |
+| V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ✅     |
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ⏳     |
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ⏳     |
 | V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ⏳     |

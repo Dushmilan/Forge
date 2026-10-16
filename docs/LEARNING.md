@@ -77,3 +77,25 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V3 — Concurrent workers
+
+- **Concept:**
+  - Competing consumers on a single channel: spawning `N` goroutines that
+    all receive from `q.jobs` turns a single worker into a worker pool with
+    zero extra locking on the queue — the channel runtime hands each record
+    to exactly one receiver.
+  - `sync.WaitGroup` for fan-out/join: `wg.Add(1)` on the parent goroutine
+    *before* `go func()`, `defer wg.Done()` inside the child, and
+    `wg.Wait()` to block until the last in-flight worker finishes.
+  - The race detector (`-race`) and shared collaborators: once `N` workers
+    call the same handler closure simultaneously, every shared side effect
+    (`store.Store` file updates, `stderr` error writes) must be synchronized.
+  - Proving concurrency without `time.Sleep`: a channel barrier that only
+    opens when all `N` workers have entered the handler at once.
+- **What I built:** A `WaitGroup`-backed worker pool in `internal/queue`
+  (`Queue.Run(ctx, workers, handler)`), race-safe `stderr` reporting in
+  `newJobHandler`, and `-workers` (default 4) on `forge serve`.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_
