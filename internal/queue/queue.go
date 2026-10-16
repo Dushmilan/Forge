@@ -1,11 +1,12 @@
 /*
 Package queue moves job execution off the request path: Enqueue buffers a
-record on a channel, Run drains it on one worker goroutine.
+record on a channel, Run drains it across a pool of worker goroutines.
 
-The whole package is V2's idea in a few lines — the queue IS the channel,
-the worker IS a goroutine in a select loop. Rebuilding a queue from a
-slice + mutex + sync.Cond is the classic pre-Go mistake; a buffered chan
-is already a thread-safe FIFO.
+The whole package is V2's idea plus V3's widening — the queue IS the
+channel, and the worker pool IS N goroutines running the same select loop
+over it. Rebuilding a queue from a slice + mutex + sync.Cond is the classic
+pre-Go mistake; a buffered chan is already a thread-safe FIFO, and it is
+already safe for concurrent receivers, so N workers need no extra lock.
 */
 package queue
 

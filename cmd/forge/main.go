@@ -170,8 +170,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	fmt.Fprintf(stdout, "listening on %s\n", ln.Addr())
 
 	// Serve in a goroutine; the main goroutine selects between the two
-	// outcomes. This is the ONLY goroutine V1 adds: it exists to bridge
-	// ctx → Shutdown, not to run jobs (that is V2).
+	// outcomes. This goroutine exists to bridge ctx → Shutdown, not to run
+	// jobs — running them is the worker pool started above.
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
@@ -198,11 +198,12 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		*/
 		signal.Reset(os.Interrupt, syscall.SIGTERM)
 		/*
-			Join the worker. The spec's shutdown contract — a running job
-			COMPLETES before we return — is only true because we wait here:
-			main calls os.Exit right after runServe, which would kill the
-			worker goroutine mid-handler. Queue.Run returns only after its
-			current handler has finished, so this channel is that guarantee.
+			Join the worker pool. The spec's shutdown contract — every
+			running job COMPLETES before we return — is only true because we
+			wait here: main calls os.Exit right after runServe, which would
+			kill the workers mid-handler. Queue.Run returns only after its
+			WaitGroup says every in-flight worker has finished, so this
+			channel is that guarantee.
 		*/
 		<-workerDone
 		return 0
