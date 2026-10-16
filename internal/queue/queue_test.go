@@ -318,3 +318,128 @@ func TestEnqueueAfterCancelWithFreeBufferReturnsError(t *testing.T) {
 		}
 	}
 }
+
+/*
+TestRunFinishesAllCurrentWorkersAndDropsQueued pins Review Focus 2: when N
+workers are mid-flight at cancellation, Run must wait for EVERY in-flight
+worker to finish (not just the first one), while still dropping any record
+left in the channel buffer.
+*/
+func TestRunFinishesAllCurrentWorkersAndDropsQueued(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	entered := make(chan string, 3)
+	gate1 := make(chan struct{})
+	gate2 := make(chan struct{})
+	handled := make(chan string, 3)
+	runDone := make(chan struct{})
+
+	go func() {
+		q.Run(ctx, 2, func(rec store.Record) {
+			entered <- rec.ID
+			switch rec.ID {
+			case "in-flight-1":
+				<-gate1
+			case "in-flight-2":
+				<-gate2
+			}
+			handled <- rec.ID
+		})
+		close(runDone)
+	}()
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "in-flight-1"})
+	mustEnqueue(t, ctx, q, store.Record{ID: "in-flight-2"})
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of 2 workers picked up a record", i)
+		}
+	}
+	mustEnqueue(t, ctx, q, store.Record{ID: "queued"})
+
+	cancel()
+
+	// Release worker 1 only — Run must still wait on worker 2.
+	close(gate1)
+	select {
+	case <-runDone:
+		t.Fatal("Run returned while worker 2 was still mid-flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release worker 2 — now wg.Wait() can complete.
+	close(gate2)
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after both workers finished")
+	}
+
+	close(handled)
+	var got []string
+	for id := range handled {
+		got = append(got, id)
+	}
+	if len(got) != 2 {
+		t.Fatalf("handled %v, want 2 in-flight records only", got)
+	}
+	for _, id := range got {
+		if id == "queued" {
+			t.Fatalf("buffered record %q was delivered after cancel", id)
+		}
+	}
+}
+
+/*
+TestEnqueueBackpressureMultipleWorkers pins that total in-system capacity
+with W workers is W (in-flight) + Capacity (buffered), and freeing a single
+worker slot unblocks a waiting Enqueue.
+*/
+func TestEnqueueBackpressureMultipleWorkers(t *testing.T) {
+	const workers = 2
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{}, workers)
+	gate := make(chan struct{})
+	defer close(gate)
+	go q.Run(ctx, workers, func(store.Record) {
+		entered <- struct{}{}
+		<-gate
+	})
+
+	for i := 0; i < workers; i++ {
+		mustEnqueue(t, ctx, q, store.Record{ID: "held-" + strconv.Itoa(i)})
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("worker %d never took its record", i)
+		}
+	}
+	for i := 0; i < queue.Capacity; i++ {
+		mustEnqueue(t, ctx, q, store.Record{ID: strconv.Itoa(i)})
+	}
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- q.Enqueue(ctx, store.Record{ID: "overflow"}) }()
+	select {
+	case err := <-blocked:
+		t.Fatalf("Enqueue returned %v with all workers busy and buffer full", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	gate <- struct{}{} /** free one worker; it pulls from the buffer and opens one slot **/
+
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatalf("unblocked Enqueue = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Enqueue never completed after one worker freed a slot")
+	}
+}
