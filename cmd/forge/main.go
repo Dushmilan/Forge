@@ -136,7 +136,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	*/
 	workerDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, newJobHandler(st, e, stderr))
+		q.Run(ctx, 1, newJobHandler(st, e, stderr))
 		close(workerDone) // closing (not just returning) lets the shutdown path JOIN
 	}()
 	srv := &http.Server{

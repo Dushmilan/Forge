@@ -139,7 +139,7 @@ func TestPostJobEnqueuesAndPersists(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	seen := make(chan store.Record, 1)
-	go q.Run(ctx, func(r store.Record) { seen <- r })
+	go q.Run(ctx, 1, func(r store.Record) { seen <- r })
 	select {
 	case got := <-seen:
 		if got.ID != body.ID {
@@ -212,7 +212,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	seen := make(chan store.Record, 1)
-	go q.Run(ctx, func(r store.Record) { seen <- r })
+	go q.Run(ctx, 1, func(r store.Record) { seen <- r })
 	select {
 	case got := <-seen:
 		t.Fatalf("a 500'd submission reached the worker: %+v", got)
@@ -270,7 +270,7 @@ func TestPostJobCancelledRequest503(t *testing.T) {
 	wctx, wcancel := context.WithCancel(context.Background())
 	defer wcancel()
 	seen := make(chan store.Record, 1)
-	go q.Run(wctx, func(r store.Record) { seen <- r })
+	go q.Run(wctx, 1, func(r store.Record) { seen <- r })
 	select {
 	case got := <-seen:
 		t.Fatalf("the 503'd record reached the worker: %+v", got)
@@ -293,7 +293,7 @@ func TestPostBlockedEnqueueGets503OnServerShutdown(t *testing.T) {
 	defer close(gate) // frees the worker's handler on the way out
 	wctx, wcancel := context.WithCancel(context.Background())
 	defer wcancel()
-	go q.Run(wctx, func(store.Record) { <-gate }) // the worker takes one job and holds it
+	go q.Run(wctx, 1, func(store.Record) { <-gate }) // the worker takes one job and holds it
 
 	for i := 0; i < queue.Capacity+1; i++ { // fill: one held + a full buffer
 		if err := q.Enqueue(wctx, store.Record{ID: strconv.Itoa(i)}); err != nil {

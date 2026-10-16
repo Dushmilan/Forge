@@ -25,7 +25,7 @@ func TestRunDeliversInOrder(t *testing.T) {
 	got := make(chan string, 3)
 	runDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, func(rec store.Record) { got <- rec.ID })
+		q.Run(ctx, 1, func(rec store.Record) { got <- rec.ID })
 		close(runDone)
 	}()
 
@@ -95,7 +95,7 @@ func TestEnqueueBackpressure(t *testing.T) {
 
 	gate := make(chan struct{})
 	defer close(gate) // frees any handler still waiting, on the way out
-	go q.Run(ctx, func(rec store.Record) { <-gate })
+	go q.Run(ctx, 1, func(rec store.Record) { <-gate })
 
 	mustEnqueue(t, ctx, q, store.Record{ID: "held"}) // the worker takes this one and blocks on gate
 	for i := 0; i < queue.Capacity; i++ {
@@ -140,7 +140,7 @@ func TestRunReturnsWhenIdle(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		q.Run(ctx, func(store.Record) {})
+		q.Run(ctx, 1, func(store.Record) {})
 		close(done)
 	}()
 
@@ -165,7 +165,7 @@ func TestRunFinishesCurrentAndDropsQueued(t *testing.T) {
 	handled := make(chan string, 2)
 	runDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, func(rec store.Record) {
+		q.Run(ctx, 1, func(rec store.Record) {
 			entered <- struct{}{}
 			<-gate
 			handled <- rec.ID
@@ -202,6 +202,94 @@ func TestRunFinishesCurrentAndDropsQueued(t *testing.T) {
 	case id := <-handled:
 		t.Fatalf("buffered record was delivered after cancel: %q", id)
 	default:
+	}
+}
+
+/*
+TestRunExecutesConcurrently proves that Run(ctx, 3, ...) actually spawns 3
+concurrent workers: 3 enqueued jobs all enter the handler before ANY of
+them is allowed to return. A single worker (or a loop that forgot `go`)
+would deadlock on the barrier.
+*/
+func TestRunExecutesConcurrently(t *testing.T) {
+	const workers = 3
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	arrived := make(chan string, workers)
+	release := make(chan struct{})
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx, workers, func(rec store.Record) {
+			arrived <- rec.ID
+			<-release
+		})
+		close(runDone)
+	}()
+
+	for i := 0; i < workers; i++ {
+		mustEnqueue(t, ctx, q, store.Record{ID: strconv.Itoa(i)})
+	}
+
+	// All 3 workers must be inside the handler at once before we release them.
+	for i := 0; i < workers; i++ {
+		select {
+		case <-arrived:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d workers entered handler concurrently", i, workers)
+		}
+	}
+	close(release)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+/*
+TestRunFastJobsBypassSlowWorker pins Review Focus 1 (why V3 exists): when
+worker 1 is occupied by a slow job, worker 2 still drains subsequent fast
+jobs to completion instead of stalling behind the slow one.
+*/
+func TestRunFastJobsBypassSlowWorker(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	slowEntered := make(chan struct{})
+	slowGate := make(chan struct{})
+	defer close(slowGate)
+	fastDone := make(chan string, 2)
+
+	go q.Run(ctx, 2, func(rec store.Record) {
+		if rec.ID == "slow" {
+			close(slowEntered)
+			<-slowGate
+			return
+		}
+		fastDone <- rec.ID
+	})
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "slow"})
+	select {
+	case <-slowEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow job never entered handler")
+	}
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "fast-1"})
+	mustEnqueue(t, ctx, q, store.Record{ID: "fast-2"})
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-fastDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("fast job %d blocked behind slow job", i+1)
+		}
 	}
 }
 

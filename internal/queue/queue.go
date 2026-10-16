@@ -12,6 +12,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/Dushmilan/Forge/internal/store"
 )
@@ -59,12 +60,36 @@ func (q *Queue) Enqueue(ctx context.Context, rec store.Record) error {
 	}
 }
 
-// Run drains the queue on the goroutine it is started on — callers must
-// write `go q.Run(...)`. Each record is handed to handler, then the loop
-// re-selects, so between jobs it can also notice ctx cancellation and
-// return. Records still buffered when that happens are dropped; the API
-// already saved them as pending, and they stay that way.
-func (q *Queue) Run(ctx context.Context, handler func(store.Record)) {
+/*
+Run drains the queue across a pool of worker goroutines and blocks until
+every worker has returned.
+
+sync.WaitGroup is the fan-out/join primitive: wg.Add(1) MUST run on the
+spawning goroutine before `go`, never inside the child goroutine — otherwise
+wg.Wait() could race ahead of the child's Add and return before the worker
+even starts.
+
+Competing consumers need no extra lock: a Go channel already guarantees
+each record is received by exactly one worker.
+*/
+func (q *Queue) Run(ctx context.Context, workers int, handler func(store.Record)) {
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done() /** decrements the counter when the worker returns **/
+			q.work(ctx, handler)
+		}()
+	}
+	wg.Wait()
+}
+
+/*
+work is one worker goroutine's lifecycle: pull a record, run handler to
+completion, then re-select. Between jobs it notices ctx cancellation and
+returns; records still buffered stay pending.
+*/
+func (q *Queue) work(ctx context.Context, handler func(store.Record)) {
 	for {
 		select {
 		case <-ctx.Done():
