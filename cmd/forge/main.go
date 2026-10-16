@@ -131,21 +131,27 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", ":8080", "address to listen on")
 	data := fs.String("data", "data", "directory holding jobs.json")
+	workers := fs.Int("workers", 4, "number of worker goroutines")
 	if err := fs.Parse(args); err != nil {
 		return 2 // flag misuse is a usage error, like no-args in run
+	}
+	if *workers < 1 {
+		fmt.Fprintln(stderr, "forge: -workers must be >= 1")
+		return 2 // a pool of zero would accept 202s and never run them
 	}
 
 	var e executor.Executor
 	st := store.New(*data)
 	q := queue.New()
 	/*
-		One context governs server AND worker: the same signal that stops
-		accepting requests also stops the worker loop. The worker finishes
-		the job it holds and drops the rest — no drain, no sleep.
+		One context governs server AND worker pool: the same signal that
+		stops accepting requests also stops every worker loop. Queue.Run
+		waits on its internal WaitGroup until all in-flight jobs finish, so
+		closing workerDone guarantees the whole pool has joined.
 	*/
 	workerDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, 1, newJobHandler(st, e, stderr))
+		q.Run(ctx, *workers, newJobHandler(st, e, stderr))
 		close(workerDone) // closing (not just returning) lets the shutdown path JOIN
 	}()
 	srv := &http.Server{

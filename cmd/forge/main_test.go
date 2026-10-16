@@ -534,3 +534,152 @@ func TestRunServeFinishesRunningJobOnShutdown(t *testing.T) {
 		t.Errorf("final status = %v, want succeeded — the job must complete before shutdown returns", stored.Status)
 	}
 }
+
+/*
+TestRunServeInvalidWorkersFlag pins Review Focus 4: a worker pool of 0 or
+fewer goroutines would accept jobs and never run them, so runServe rejects
+-workers < 1 at flag validation time with exit code 2 (usage error).
+
+Each case also asserts WHY it was rejected. An undefined flag also exits 2,
+so "exit 2 + stderr" alone passes even when the flag does not exist — the
+substring pins that the numeric cases were rejected by value validation and
+the garbage case by the flag parser, not by the flag being missing.
+*/
+func TestRunServeInvalidWorkersFlag(t *testing.T) {
+	tests := []struct {
+		val     string
+		wantSub string
+	}{
+		{"0", "-workers must be >= 1"},
+		{"-1", "-workers must be >= 1"},
+		{"not-a-number", "invalid value"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.val, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runServe(context.Background(), []string{"-workers", tt.val}, &stdout, &stderr)
+			if code != 2 {
+				t.Errorf("runServe(-workers %s) = %d, want 2", tt.val, code)
+			}
+			if !strings.Contains(stderr.String(), tt.wantSub) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantSub)
+			}
+		})
+	}
+}
+
+/*
+TestRunServeRunsJobsConcurrently proves V3's headline end to end: when a
+slow job ("sleep 1") is already running on forge serve, a fast job
+("echo fast") submitted behind it completes BEFORE the slow job finishes,
+and shutdown still waits for the slow job to complete cleanly.
+*/
+func TestRunServeRunsJobsConcurrently(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := newLineWriter()
+	code := make(chan int, 1)
+	go func() {
+		code <- runServe(ctx, []string{"-addr", "127.0.0.1:0", "-data", t.TempDir(), "-workers", "2"}, out, io.Discard)
+	}()
+
+	var addr string
+	select {
+	case line := <-out.ch:
+		addr = strings.TrimPrefix(line, "listening on ")
+		if addr == line {
+			t.Fatalf("unexpected startup line %q", line)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe never printed its listening address")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	// 1. Submit the slow job and wait until a worker marks it running.
+	slowResp, err := http.Post("http://"+addr+"/jobs", "application/json",
+		strings.NewReader(`{"command": ["sleep", "1"]}`))
+	if err != nil {
+		t.Fatalf("POST slow failed: %v", err)
+	}
+	var slowRec store.Record
+	if err := json.NewDecoder(slowResp.Body).Decode(&slowRec); err != nil {
+		t.Fatalf("decode slow POST: %v", err)
+	}
+	slowResp.Body.Close()
+
+	for {
+		r, err := http.Get("http://" + addr + "/jobs/" + slowRec.ID)
+		if err != nil {
+			t.Fatalf("GET slow failed: %v", err)
+		}
+		var got store.Record
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		r.Body.Close()
+		if got.Status == job.StatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slow job never reached running; last status %v", got.Status)
+		}
+		time.Sleep(time.Millisecond) // poll interval; the deadline is the guarantee
+	}
+
+	// 2. Submit the fast job while worker 1 is busy with sleep 1.
+	fastResp, err := http.Post("http://"+addr+"/jobs", "application/json",
+		strings.NewReader(`{"command": ["echo", "fast"]}`))
+	if err != nil {
+		t.Fatalf("POST fast failed: %v", err)
+	}
+	var fastRec store.Record
+	if err := json.NewDecoder(fastResp.Body).Decode(&fastRec); err != nil {
+		t.Fatalf("decode fast POST: %v", err)
+	}
+	fastResp.Body.Close()
+
+	for {
+		r, err := http.Get("http://" + addr + "/jobs/" + fastRec.ID)
+		if err != nil {
+			t.Fatalf("GET fast failed: %v", err)
+		}
+		var got store.Record
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		r.Body.Close()
+		if got.Status == job.StatusSucceeded {
+			if got.Result.Stdout != "fast\n" {
+				t.Errorf("fast stdout = %q, want %q", got.Result.Stdout, "fast\n")
+			}
+			break
+		}
+		if got.Status == job.StatusFailed {
+			t.Fatalf("fast job failed: %+v", got)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fast job never finished; last status %v", got.Status)
+		}
+		time.Sleep(time.Millisecond) // poll interval; the deadline is the guarantee
+	}
+
+	// The slow job must STILL be running — proving the fast job overtook it.
+	r, err := http.Get("http://" + addr + "/jobs/" + slowRec.ID)
+	if err != nil {
+		t.Fatalf("GET slow check failed: %v", err)
+	}
+	var slowNow store.Record
+	_ = json.NewDecoder(r.Body).Decode(&slowNow)
+	r.Body.Close()
+	if slowNow.Status != job.StatusRunning {
+		t.Errorf("slow job status = %v, want running while fast job already finished", slowNow.Status)
+	}
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down after cancel")
+	}
+}
