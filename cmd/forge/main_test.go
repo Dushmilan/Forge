@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -314,6 +315,45 @@ func TestJobHandlerSaveFailureGoesToStderr(t *testing.T) {
 	case <-fake.started:
 		t.Fatal("executor ran even though marking the job running failed")
 	default:
+	}
+}
+
+/*
+TestJobHandlerConcurrentSaveFailuresRaceFree pins Review Focus 3: when
+multiple worker goroutines share one handler closure and st.Save fails
+concurrently, their stderr writes must not race on the io.Writer.
+*/
+func TestJobHandlerConcurrentSaveFailuresRaceFree(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New(filepath.Join(blocker, "data"))
+	fake := &fakeRunner{
+		started: make(chan struct{}, 8),
+		release: make(chan struct{}),
+	}
+	close(fake.release)
+
+	var stderr bytes.Buffer
+	h := newJobHandler(st, fake, &stderr)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		id := fmt.Sprintf("j-%d", i)
+		go func() {
+			defer wg.Done()
+			h(store.Record{ID: id, Command: []string{"true"}, Status: job.StatusPending})
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < 8; i++ {
+		want := fmt.Sprintf("j-%d", i)
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q; got %q", want, stderr.String())
+		}
 	}
 }
 
