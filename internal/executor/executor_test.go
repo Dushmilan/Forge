@@ -1,10 +1,16 @@
 package executor_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
@@ -18,7 +24,7 @@ import (
 func TestExecutorRunCapturesStdout(t *testing.T) {
 	e := executor.Executor{}
 
-	res, err := e.Run(job.Job{ID: "j1", Command: []string{"echo", "hello"}})
+	res, err := e.Run(context.Background(), job.Job{ID: "j1", Command: []string{"echo", "hello"}})
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -41,7 +47,7 @@ func TestExecutorRunCapturesStdout(t *testing.T) {
 func TestExecutorRunMissingProgramIsNotAnExitError(t *testing.T) {
 	e := executor.Executor{}
 
-	_, err := e.Run(job.Job{ID: "j3", Command: []string{"forge-no-such-binary-xyz"}})
+	_, err := e.Run(context.Background(), job.Job{ID: "j3", Command: []string{"forge-no-such-binary-xyz"}})
 	if err == nil {
 		t.Fatal("Run() error = nil, want an error")
 	}
@@ -62,7 +68,7 @@ func TestExecutorRunMissingProgramIsNotAnExitError(t *testing.T) {
 func TestExecutorImplementsRunner(t *testing.T) {
 	var r executor.Runner = executor.Executor{}
 
-	res, err := r.Run(job.Job{ID: "j-iface", Command: []string{"echo", "via-interface"}})
+	res, err := r.Run(context.Background(), job.Job{ID: "j-iface", Command: []string{"echo", "via-interface"}})
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -77,7 +83,7 @@ func TestExecutorImplementsRunner(t *testing.T) {
 func TestExecutorRunRejectsInvalidJob(t *testing.T) {
 	e := executor.Executor{}
 
-	_, err := e.Run(job.Job{}) // no ID, no command
+	_, err := e.Run(context.Background(), job.Job{}) // no ID, no command
 	if err == nil {
 		t.Fatal("Run() error = nil, want an error")
 	}
@@ -95,7 +101,7 @@ func TestExecutorRunRejectsInvalidJob(t *testing.T) {
 func TestExecutorRunNonZeroExitIsAnError(t *testing.T) {
 	e := executor.Executor{}
 
-	res, err := e.Run(job.Job{ID: "j2", Command: []string{"false"}})
+	res, err := e.Run(context.Background(), job.Job{ID: "j2", Command: []string{"false"}})
 	if err == nil {
 		t.Fatal("Run() error = nil, want an error for a non-zero exit")
 	}
@@ -106,5 +112,79 @@ func TestExecutorRunNonZeroExitIsAnError(t *testing.T) {
 	}
 	if res.ExitCode != 1 {
 		t.Errorf("ExitCode = %d, want 1", res.ExitCode)
+	}
+}
+
+/*
+TestExecutorRunCancelledBeforeStart proves a dead context is checked before
+the process is created: a cancelled job must never touch the OS.
+*/
+func TestExecutorRunCancelledBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := (executor.Executor{}).Run(ctx, job.Job{ID: "j-cancel", Command: []string{"echo", "hi"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want wrapped context.Canceled", err)
+	}
+	if res.Stdout != "" {
+		t.Errorf("Stdout = %q, want empty — the process must not start", res.Stdout)
+	}
+}
+
+/*
+TestExecutorRunKillsRunningProcess pins the headline: exec.CommandContext
+kills the child when ctx ends. The marker file proves the process actually
+started before we cancel, so the test cannot pass by refusing to launch it.
+`exec sleep 10` replaces the shell, so no grandchild survives the kill.
+*/
+func TestExecutorRunKillsRunningProcess(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (executor.Executor{}).Run(ctx, job.Job{
+			ID:      "j-kill",
+			Command: []string{"sh", "-c", fmt.Sprintf("touch %s; exec sleep 10", strconv.Quote(marker))},
+		})
+		done <- err
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("command never started; cannot test the kill path")
+		}
+		time.Sleep(time.Millisecond) // poll interval only; the deadline is the guarantee
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want wrapped context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel — the process was not killed")
+	}
+}
+
+/*
+TestExecutorRunDeadlineExceeded pins the timeout flavour of the same path:
+WithTimeout's cause is DeadlineExceeded, and callers must be able to tell it
+apart from an explicit cancel with errors.Is.
+*/
+func TestExecutorRunDeadlineExceeded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := (executor.Executor{}).Run(ctx, job.Job{ID: "j-timeout", Command: []string{"sleep", "10"}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want wrapped context.DeadlineExceeded", err)
 	}
 }

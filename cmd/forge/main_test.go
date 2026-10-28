@@ -168,7 +168,7 @@ type fakeRunner struct {
 	err     error
 }
 
-func (f *fakeRunner) Run(j job.Job) (executor.Result, error) {
+func (f *fakeRunner) Run(_ context.Context, j job.Job) (executor.Result, error) {
 	f.started <- struct{}{}
 	<-f.release
 	return f.res, f.err

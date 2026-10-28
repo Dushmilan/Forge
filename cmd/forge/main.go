@@ -63,7 +63,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	j := job.Job{ID: "cli", Command: args}
 
 	var e executor.Executor
-	res, err := e.Run(j)
+	res, err := e.Run(context.Background(), j)
 	if err != nil {
 		fmt.Fprintf(stderr, "forge: %v\n", err)
 		// Propagate the command's own exit code when it ran and failed, so
@@ -105,7 +105,7 @@ func newJobHandler(st *store.Store, exec executor.Runner, stderr io.Writer) func
 			return
 		}
 
-		res, err := exec.Run(job.Job{ID: rec.ID, Command: rec.Command})
+		res, err := exec.Run(context.Background(), job.Job{ID: rec.ID, Command: rec.Command})
 		rec.Result = res
 		if err != nil {
 			rec.Status = job.StatusFailed
