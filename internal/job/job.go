@@ -27,6 +27,7 @@ const (
 	StatusRunning
 	StatusSucceeded
 	StatusFailed
+	StatusCancelled // appended: existing iota values must never shift
 )
 
 // String makes Status satisfy fmt.Stringer. Go interfaces are satisfied
@@ -42,6 +43,8 @@ func (s Status) String() string {
 		return "succeeded"
 	case StatusFailed:
 		return "failed"
+	case StatusCancelled:
+		return "cancelled"
 	default:
 		// int(s) formats the underlying number. Using %v here instead would
 		// re-enter String() through fmt's Stringer path and recurse forever.
@@ -76,6 +79,8 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 		*s = StatusSucceeded
 	case "failed":
 		*s = StatusFailed
+	case "cancelled":
+		*s = StatusCancelled
 	default:
 		return fmt.Errorf("job: unknown status %q", name)
 	}
@@ -85,6 +90,20 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 // Compile-time proof that Status implements fmt.Stringer. If the method set
 // ever drifts, this line stops the build — no runtime check required.
 var _ fmt.Stringer = Status(0)
+
+/*
+Terminal reports whether a status can still change. A DELETE may only act on
+a non-terminal job; this is the state machine's own answer, not a list of
+strings duplicated in the API.
+*/
+func (s Status) Terminal() bool {
+	switch s {
+	case StatusSucceeded, StatusFailed, StatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // Job is a unit of work: what to run, plus the state it is in.
 //

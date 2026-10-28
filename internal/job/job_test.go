@@ -21,6 +21,7 @@ func TestStatusString(t *testing.T) {
 		{"running", job.StatusRunning, "running"},
 		{"succeeded", job.StatusSucceeded, "succeeded"},
 		{"failed", job.StatusFailed, "failed"},
+		{"cancelled", job.StatusCancelled, "cancelled"},
 	}
 
 	for _, tc := range cases {
@@ -85,6 +86,7 @@ func TestStatusJSONRoundTrip(t *testing.T) {
 		{name: "running", status: job.StatusRunning, want: `"running"`},
 		{name: "succeeded", status: job.StatusSucceeded, want: `"succeeded"`},
 		{name: "failed", status: job.StatusFailed, want: `"failed"`},
+		{name: "cancelled", status: job.StatusCancelled, want: `"cancelled"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -115,6 +117,29 @@ func TestStatusUnmarshalRejectsUnknown(t *testing.T) {
 		var s job.Status
 		if err := json.Unmarshal([]byte(in), &s); err == nil {
 			t.Errorf("Unmarshal(%s) = nil error, want error", in)
+		}
+	}
+}
+
+/*
+TestStatusTerminal pins the state machine's final states. The API uses it to
+answer 409 for DELETE on a job that already ended — a cancelled job is as
+final as a succeeded one.
+*/
+func TestStatusTerminal(t *testing.T) {
+	tests := []struct {
+		status job.Status
+		want   bool
+	}{
+		{job.StatusPending, false},
+		{job.StatusRunning, false},
+		{job.StatusSucceeded, true},
+		{job.StatusFailed, true},
+		{job.StatusCancelled, true},
+	}
+	for _, tt := range tests {
+		if got := tt.status.Terminal(); got != tt.want {
+			t.Errorf("%v.Terminal() = %v, want %v", tt.status, got, tt.want)
 		}
 	}
 }
