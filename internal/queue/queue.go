@@ -73,7 +73,7 @@ even starts.
 Competing consumers need no extra lock: a Go channel already guarantees
 each record is received by exactly one worker.
 */
-func (q *Queue) Run(ctx context.Context, workers int, handler func(store.Record)) {
+func (q *Queue) Run(ctx context.Context, workers int, handler func(context.Context, store.Record)) {
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -90,7 +90,7 @@ work is one worker goroutine's lifecycle: pull a record, run handler to
 completion, then re-select. Between jobs it notices ctx cancellation and
 returns; records still buffered stay pending.
 */
-func (q *Queue) work(ctx context.Context, handler func(store.Record)) {
+func (q *Queue) work(ctx context.Context, handler func(context.Context, store.Record)) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -109,7 +109,7 @@ func (q *Queue) work(ctx context.Context, handler func(store.Record)) {
 				return
 			default:
 			}
-			handler(rec)
+			handler(ctx, rec)
 		}
 	}
 }

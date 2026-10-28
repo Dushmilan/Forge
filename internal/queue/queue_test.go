@@ -25,7 +25,7 @@ func TestRunDeliversInOrder(t *testing.T) {
 	got := make(chan string, 3)
 	runDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, 1, func(rec store.Record) { got <- rec.ID })
+		q.Run(ctx, 1, func(_ context.Context, rec store.Record) { got <- rec.ID })
 		close(runDone)
 	}()
 
@@ -95,7 +95,7 @@ func TestEnqueueBackpressure(t *testing.T) {
 
 	gate := make(chan struct{})
 	defer close(gate) // frees any handler still waiting, on the way out
-	go q.Run(ctx, 1, func(rec store.Record) { <-gate })
+	go q.Run(ctx, 1, func(_ context.Context, rec store.Record) { <-gate })
 
 	mustEnqueue(t, ctx, q, store.Record{ID: "held"}) // the worker takes this one and blocks on gate
 	for i := 0; i < queue.Capacity; i++ {
@@ -140,7 +140,7 @@ func TestRunReturnsWhenIdle(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		q.Run(ctx, 1, func(store.Record) {})
+		q.Run(ctx, 1, func(context.Context, store.Record) {})
 		close(done)
 	}()
 
@@ -165,7 +165,7 @@ func TestRunFinishesCurrentAndDropsQueued(t *testing.T) {
 	handled := make(chan string, 2)
 	runDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, 1, func(rec store.Record) {
+		q.Run(ctx, 1, func(_ context.Context, rec store.Record) {
 			entered <- struct{}{}
 			<-gate
 			handled <- rec.ID
@@ -221,7 +221,7 @@ func TestRunExecutesConcurrently(t *testing.T) {
 	release := make(chan struct{})
 	runDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, workers, func(rec store.Record) {
+		q.Run(ctx, workers, func(_ context.Context, rec store.Record) {
 			arrived <- rec.ID
 			<-release
 		})
@@ -265,7 +265,7 @@ func TestRunFastJobsBypassSlowWorker(t *testing.T) {
 	defer close(slowGate)
 	fastDone := make(chan string, 2)
 
-	go q.Run(ctx, 2, func(rec store.Record) {
+	go q.Run(ctx, 2, func(_ context.Context, rec store.Record) {
 		if rec.ID == "slow" {
 			close(slowEntered)
 			<-slowGate
@@ -336,7 +336,7 @@ func TestRunFinishesAllCurrentWorkersAndDropsQueued(t *testing.T) {
 	runDone := make(chan struct{})
 
 	go func() {
-		q.Run(ctx, 2, func(rec store.Record) {
+		q.Run(ctx, 2, func(_ context.Context, rec store.Record) {
 			entered <- rec.ID
 			switch rec.ID {
 			case "in-flight-1":
@@ -407,7 +407,7 @@ func TestEnqueueBackpressureMultipleWorkers(t *testing.T) {
 	entered := make(chan struct{}, workers)
 	gate := make(chan struct{})
 	defer close(gate)
-	go q.Run(ctx, workers, func(store.Record) {
+	go q.Run(ctx, workers, func(context.Context, store.Record) {
 		entered <- struct{}{}
 		<-gate
 	})
@@ -441,5 +441,29 @@ func TestEnqueueBackpressureMultipleWorkers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Enqueue never completed after one worker freed a slot")
+	}
+}
+
+/*
+TestRunPassesLifecycleContext pins context propagation: the handler receives
+the SAME context Run was given, so cancellation and shutdown decisions reach
+the worker without a global or a struct field.
+*/
+func TestRunPassesLifecycleContext(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	got := make(chan context.Context, 1)
+	go q.Run(ctx, 1, func(hctx context.Context, _ store.Record) { got <- hctx })
+	mustEnqueue(t, ctx, q, store.Record{ID: "ctx"})
+
+	select {
+	case hctx := <-got:
+		if hctx != ctx {
+			t.Errorf("handler context = %p, want the Run context %p", hctx, ctx)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never received the record")
 	}
 }

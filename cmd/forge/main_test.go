@@ -190,7 +190,7 @@ func TestJobHandlerRunsAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newJobHandler(st, fake, io.Discard)(pending)
+	newJobHandler(st, fake, io.Discard)(context.Background(), pending)
 
 	stored, err := st.Get("j1")
 	if err != nil {
@@ -220,7 +220,7 @@ func TestJobHandlerMarksRunningMidFlight(t *testing.T) {
 
 	handlerDone := make(chan struct{})
 	go func() {
-		newJobHandler(st, fake, io.Discard)(pending)
+		newJobHandler(st, fake, io.Discard)(context.Background(), pending)
 		close(handlerDone)
 	}()
 
@@ -270,7 +270,7 @@ func TestJobHandlerRunFailureIsData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newJobHandler(st, fake, io.Discard)(pending)
+	newJobHandler(st, fake, io.Discard)(context.Background(), pending)
 
 	stored, err := st.Get("j1")
 	if err != nil {
@@ -306,7 +306,7 @@ func TestJobHandlerSaveFailureGoesToStderr(t *testing.T) {
 	var stderr bytes.Buffer
 
 	pending := store.Record{ID: "j1", Command: []string{"true"}, Status: job.StatusPending}
-	newJobHandler(st, fake, &stderr)(pending)
+	newJobHandler(st, fake, &stderr)(context.Background(), pending)
 
 	if !strings.Contains(stderr.String(), "j1") {
 		t.Errorf("stderr = %q, want it to name the job whose save failed", stderr.String())
@@ -344,7 +344,7 @@ func TestJobHandlerConcurrentSaveFailuresRaceFree(t *testing.T) {
 		id := fmt.Sprintf("j-%d", i)
 		go func() {
 			defer wg.Done()
-			h(store.Record{ID: id, Command: []string{"true"}, Status: job.StatusPending})
+			h(context.Background(), store.Record{ID: id, Command: []string{"true"}, Status: job.StatusPending})
 		}()
 	}
 	wg.Wait()

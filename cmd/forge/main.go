@@ -91,14 +91,14 @@ has. Because V3 runs N workers against this same closure concurrently and
 an arbitrary io.Writer is not goroutine-safe, errMu serializes the stderr
 writes just as store.Store's mutex serializes the file writes.
 */
-func newJobHandler(st *store.Store, exec executor.Runner, stderr io.Writer) func(store.Record) {
+func newJobHandler(st *store.Store, exec executor.Runner, stderr io.Writer) func(context.Context, store.Record) {
 	var errMu sync.Mutex
 	reportSaveErr := func(id string, err error) {
 		errMu.Lock()
 		defer errMu.Unlock()
 		fmt.Fprintf(stderr, "forge: save job %s: %v\n", id, err)
 	}
-	return func(rec store.Record) {
+	return func(_ context.Context, rec store.Record) {
 		rec.Status = job.StatusRunning
 		if err := st.Save(rec); err != nil {
 			reportSaveErr(rec.ID, err)
