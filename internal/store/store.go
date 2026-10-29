@@ -32,6 +32,9 @@ type Record struct {
 	Status  job.Status      `json:"status"`
 	Result  executor.Result `json:"result,omitempty"`
 	Err     string          `json:"error,omitempty"`
+	// Attempts counts executions started. A retried job ends with more than
+	// one; a job cancelled before it ever started stays at zero.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // Store reads and writes <dir>/jobs.json. The zero construction is New;

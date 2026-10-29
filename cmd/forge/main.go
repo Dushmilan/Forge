@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/store"
+	"github.com/Dushmilan/Forge/internal/worker"
 )
 
 func main() {
@@ -79,46 +79,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-/*
-newJobHandler builds the worker's per-record function: mark running,
-execute through V0's Runner seam, persist the outcome. It is V1's honesty
-rules moved off the request path — a failed run is data (status failed +
-error message), never an exception.
-
-A Save failure inside the worker has no client to answer and no logger
-yet (V9); stderr is the most honest destination pre-observability Forge
-has. Because V3 runs N workers against this same closure concurrently and
-an arbitrary io.Writer is not goroutine-safe, errMu serializes the stderr
-writes just as store.Store's mutex serializes the file writes.
-*/
-func newJobHandler(st *store.Store, exec executor.Runner, stderr io.Writer) func(context.Context, store.Record) {
-	var errMu sync.Mutex
-	reportSaveErr := func(id string, err error) {
-		errMu.Lock()
-		defer errMu.Unlock()
-		fmt.Fprintf(stderr, "forge: save job %s: %v\n", id, err)
-	}
-	return func(_ context.Context, rec store.Record) {
-		rec.Status = job.StatusRunning
-		if err := st.Save(rec); err != nil {
-			reportSaveErr(rec.ID, err)
-			return
-		}
-
-		res, err := exec.Run(context.Background(), job.Job{ID: rec.ID, Command: rec.Command})
-		rec.Result = res
-		if err != nil {
-			rec.Status = job.StatusFailed
-			rec.Err = err.Error()
-		} else {
-			rec.Status = job.StatusSucceeded
-		}
-		if err := st.Save(rec); err != nil {
-			reportSaveErr(rec.ID, err)
-		}
-	}
-}
-
 // runServe parses serve flags, wires store + API into an http.Server, and
 // serves until ctx is cancelled. It returns an exit code rather than
 // calling os.Exit, keeping main the only place that terminates the process
@@ -143,6 +103,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	var e executor.Executor
 	st := store.New(*data)
 	q := queue.New()
+	w := worker.New(st, e, worker.Config{MaxAttempts: 3, Backoff: 100 * time.Millisecond, Timeout: 30 * time.Second}, stderr)
 	/*
 		One context governs server AND worker pool: the same signal that
 		stops accepting requests also stops every worker loop. Queue.Run
@@ -151,7 +112,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	*/
 	workerDone := make(chan struct{})
 	go func() {
-		q.Run(ctx, *workers, newJobHandler(st, e, stderr))
+		q.Run(ctx, *workers, w.Handle)
 		close(workerDone) // closing (not just returning) lets the shutdown path JOIN
 	}()
 	srv := &http.Server{
