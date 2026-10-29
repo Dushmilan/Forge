@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V3 are done. V4–V11 are planned.
+**Status:** V0–V4 are done. V5–V11 are planned.
 
 ## Quick start
 
@@ -24,20 +24,24 @@ any other Unix tool. Called with no arguments it prints usage and exits 2.
 
 ```sh
 go build ./cmd/forge
-./forge serve -addr :8080 -data ./data -workers 4
+./forge serve -addr :8080 -data ./data -workers 4 \
+  -max-attempts 3 -retry-backoff 100ms -job-timeout 30s
 ```
 
 ```sh
 curl -X POST localhost:8080/jobs -d '{"command": ["echo", "hello"]}'   # 202 + pending record
 curl localhost:8080/jobs/<id>                                          # 200 + record (poll for final status)
+curl -X DELETE localhost:8080/jobs/<id>                                # 202: cancel queued or running
 ```
 
 Jobs run asynchronously (V2): the POST returns 202 with a `pending` record
 as soon as it is queued, and `GET` shows the record moving
-`pending → running → succeeded|failed` as a worker runs it. As of V3 a pool
-of worker goroutines (`-workers`, default 4) drains the queue
-concurrently, so a slow job no longer blocks the ones behind it. Every
-submitted job is persisted to `<data>/jobs.json`.
+`pending → running → succeeded|failed|cancelled` as a worker runs it. As of V3
+a pool of worker goroutines (`-workers`, default 4) drains the queue
+concurrently, so a slow job no longer blocks the ones behind it. As of V4 a
+failed attempt is retried with exponential backoff up to `-max-attempts`, every
+job runs under `-job-timeout`, and `DELETE` cancels a queued or running job.
+Every submitted job is persisted to `<data>/jobs.json`.
 
 Run the tests:
 
@@ -117,9 +121,31 @@ POST /jobs ──▶ api.Server ──▶ queue.Enqueue ──▶ ┌─ worker 
 
 - [`internal/queue`](internal/queue) — `Run(ctx, workers, handler)` fans out
   `N` goroutines over the channel and joins them with a `sync.WaitGroup`.
-- [`cmd/forge`](cmd/forge) — `serve -workers N` (default 4); `newJobHandler`
-  serializes its `stderr` error writes so concurrent workers stay
-  `-race` clean.
+- [`cmd/forge`](cmd/forge) — `serve -workers N` (default 4); the job handler
+  serializes its `stderr` error writes so concurrent workers stay `-race`
+  clean (the handler itself moved to `internal/worker` in V4).
+
+## How it works (V4)
+
+V4 gives each job a lifetime. A failed attempt is retried with exponential
+backoff until `-max-attempts`; every job runs under `-job-timeout`; and
+`DELETE /jobs/{id}` stops a job — running or still queued:
+
+```
+POST /jobs ──▶ queue ──▶ worker.Handle ──▶ executor.Run(ctx, job)
+                              │                  │
+                              │        exec.CommandContext kills on cancel
+                              │
+                 registry: running[id] = cancel func
+                           cancelled[id] = tombstone (still in channel)
+```
+
+- [`internal/worker`](internal/worker) — claim/cancel registry, retry loop,
+  `time.NewTimer` backoff that wakes on cancellation.
+- [`internal/executor`](internal/executor) — takes a `context.Context` and
+  wraps `ctx.Err()` so `errors.Is(err, context.Canceled)` works.
+- [`internal/api`](internal/api) — `DELETE /jobs/{id}` answers 202 (409 if the
+  job already ended); cancellation is asynchronous, so poll `GET`.
 
 ## The ladder
 
@@ -129,7 +155,7 @@ POST /jobs ──▶ api.Server ──▶ queue.Enqueue ──▶ ┌─ worker 
 | V1  | API + persistent jobs          | `net/http`, handlers, JSON, file/SQL persistence | ✅     |
 | V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ✅     |
 | V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ✅     |
-| V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ⏳     |
+| V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ✅     |
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ⏳     |
 | V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ⏳     |
 | V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ⏳     |
@@ -153,6 +179,7 @@ Forge/
 │   ├── executor/          # synchronous command execution
 │   ├── store/             # JSON file persistence (V1)
 │   ├── queue/             # channel + worker loop (V2)
+│   ├── worker/            # retries, backoff, timeouts, cancellation (V4)
 │   └── api/               # HTTP handlers (V1, async since V2)
 └── docs/
     ├── LEARNING.md        # one entry per version: what Go concept clicked

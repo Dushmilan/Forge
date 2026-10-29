@@ -99,3 +99,27 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V4 — Retries + cancellation
+
+- **Concept:**
+  - `context` as three distinct lifetimes: the server's (shutdown), the
+    job's (DELETE/timeout), and the attempt's. `context.WithoutCancel`
+    detaches execution from shutdown — V3's "running jobs finish" survives —
+    while `WithTimeout` and the registered `CancelFunc` still stop it.
+  - `exec.CommandContext` is the whole cancellation mechanism at the process
+    boundary: the child is killed when the context ends, and preferring
+    `ctx.Err()` over "signal: killed" keeps `errors.Is` useful.
+  - `time.NewTimer` inside a `select` with `ctx.Done()`: backoff is a wait
+    that can be interrupted, never a `time.Sleep` that ignores shutdown.
+  - A mutex-guarded claim registry (cancel funcs + tombstones) makes
+    "cancel a queued job" deterministic without a store compare-and-swap:
+    only the worker goroutine writes statuses.
+  - `defer` as the cleanup ledger: `cancel()`, `timer.Stop()`, registry
+    release — each one runs on every return path, including cancellation.
+- **What I built:** context-aware `executor.Runner`; a `worker` package with
+  retries, exponential backoff, timeouts, and cancel-by-id; `StatusCancelled`;
+  `DELETE /jobs/{id}`; `-max-attempts`, `-retry-backoff`, `-job-timeout`.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_
