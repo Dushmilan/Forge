@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 
@@ -109,7 +110,7 @@ func (w *Worker) Handle(ctx context.Context, rec store.Record) {
 			return
 		}
 
-		if !w.wait(ctx, execCtx, w.cfg.Backoff<<(attempt-1)) {
+		if !w.wait(ctx, execCtx, backoffFor(w.cfg.Backoff, attempt)) {
 			if cerr := execCtx.Err(); cerr != nil {
 				w.finishCancelled(rec, cerr)
 			} else {
@@ -180,6 +181,27 @@ func (w *Worker) finishCancelled(rec store.Record, cause error) {
 }
 
 /*
+backoffFor computes base * 2^(attempt-1) without overflowing time.Duration.
+Doubling an int64 wraps negative after ~63 steps; time.NewTimer treats a
+non-positive delay as "fire now", so an unbounded shift silently becomes a
+hot retry loop. Saturating at the largest Duration keeps the wait long.
+*/
+func backoffFor(base time.Duration, attempt int) time.Duration {
+	if attempt < 1 {
+		return base
+	}
+	const max = time.Duration(math.MaxInt64)
+	d := base
+	for i := 1; i < attempt; i++ {
+		if d > max/2 {
+			return max
+		}
+		d *= 2
+	}
+	return d
+}
+
+/*
 wait sleeps for d, but wakes early when either context ends: shutdown must
 not be delayed by a backoff timer, and a cancel must interrupt the wait
 immediately. defer timer.Stop is the cleanup that prevents a fired timer's
@@ -194,8 +216,15 @@ func (w *Worker) wait(ctx, execCtx context.Context, d time.Duration) bool {
 	case <-execCtx.Done():
 		return false
 	case <-t.C:
-		return true
+		/*
+			Both cases can be ready at once (the timer fired as shutdown
+			landed) and select chooses pseudo-randomly — so the timer must
+			re-check the contexts, or one more attempt starts after Ctrl-C.
+			This is V2's post-select priority rule in queue.work, applied to
+			a timer instead of a channel receive.
+		*/
 	}
+	return ctx.Err() == nil && execCtx.Err() == nil
 }
 
 /*
