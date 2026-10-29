@@ -19,19 +19,39 @@ import (
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
-// newServer builds a Server over a temp-dir store and a fresh queue. No
-// executor: as of V2 the API hands jobs off, it never runs them.
-func newServer(t *testing.T) (*api.Server, *store.Store, *queue.Queue) {
+// fakeCanceller records the ids the API asked to stop. Cancellation itself
+// belongs to the worker; the API test only pins the hand-off.
+type fakeCanceller struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (f *fakeCanceller) Cancel(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ids = append(f.ids, id)
+}
+
+func (f *fakeCanceller) cancelled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ids...)
+}
+
+// newServer builds a Server over a temp-dir store, a fresh queue, and a fake
+// canceller. No executor: as of V2 the API hands jobs off, it never runs them.
+func newServer(t *testing.T) (*api.Server, *store.Store, *queue.Queue, *fakeCanceller) {
 	t.Helper()
 	st := store.New(t.TempDir())
 	q := queue.New()
-	return api.New(context.Background(), q, st), st, q
+	c := &fakeCanceller{}
+	return api.New(context.Background(), q, st, c), st, q, c
 }
 
 // TestGetJobFound pins the happy path: 200, JSON content type, and a body
 // whose id matches the path.
 func TestGetJobFound(t *testing.T) {
-	srv, st, _ := newServer(t)
+	srv, st, _, _ := newServer(t)
 	if err := st.Save(store.Record{ID: "job1", Command: []string{"true"}, Status: job.StatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +79,7 @@ func TestGetJobFound(t *testing.T) {
 // TestGetJobMissing pins the 404 contract: JSON error body carrying the
 // id, so a client can tell WHICH job was missing.
 func TestGetJobMissing(t *testing.T) {
-	srv, _, _ := newServer(t)
+	srv, _, _, _ := newServer(t)
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/jobs/ghost", nil))
@@ -80,7 +100,7 @@ func TestGetJobMissing(t *testing.T) {
 // (Review Focus 3): 405 for a known path with the wrong verb, 404 for an
 // unknown path. Pinned so nobody later "fixes" these into 200s.
 func TestMethodAndPathFallbacks(t *testing.T) {
-	srv, _, _ := newServer(t)
+	srv, _, _, _ := newServer(t)
 	h := srv.Handler()
 
 	tests := []struct {
@@ -88,7 +108,7 @@ func TestMethodAndPathFallbacks(t *testing.T) {
 		req  *http.Request
 		want int
 	}{
-		{"wrong method", httptest.NewRequest(http.MethodDelete, "/jobs/x", nil), http.StatusMethodNotAllowed},
+		{"wrong method", httptest.NewRequest(http.MethodPatch, "/jobs/x", nil), http.StatusMethodNotAllowed},
 		{"unknown path", httptest.NewRequest(http.MethodGet, "/nope", nil), http.StatusNotFound},
 	}
 	for _, tt := range tests {
@@ -106,7 +126,7 @@ func TestMethodAndPathFallbacks(t *testing.T) {
 // with the PENDING record, that record is persisted BEFORE the response,
 // and it reaches a worker — the request itself never waits for the run.
 func TestPostJobEnqueuesAndPersists(t *testing.T) {
-	srv, st, q := newServer(t)
+	srv, st, q, _ := newServer(t)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
@@ -166,7 +186,7 @@ func TestPostJobRejections(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, _, _ := newServer(t)
+			srv, _, _, _ := newServer(t)
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(tt.body))
@@ -193,7 +213,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := queue.New()
-	srv := api.New(context.Background(), q, store.New(filepath.Join(blocker, "data")))
+	srv := api.New(context.Background(), q, store.New(filepath.Join(blocker, "data")), &fakeCanceller{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
@@ -229,7 +249,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 func TestPostJobCancelledRequest503(t *testing.T) {
 	dir := t.TempDir()
 	q := queue.New()
-	srv := api.New(context.Background(), q, store.New(dir))
+	srv := api.New(context.Background(), q, store.New(dir), &fakeCanceller{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // as if the server were already shutting down
@@ -287,7 +307,7 @@ func TestPostBlockedEnqueueGets503OnServerShutdown(t *testing.T) {
 	st := store.New(t.TempDir())
 	q := queue.New()
 	sctx, scancel := context.WithCancel(context.Background())
-	srv := api.New(sctx, q, st)
+	srv := api.New(sctx, q, st, &fakeCanceller{})
 
 	gate := make(chan struct{})
 	defer close(gate) // frees the worker's handler on the way out
@@ -331,7 +351,7 @@ func TestPostBlockedEnqueueGets503OnServerShutdown(t *testing.T) {
 // a known id. If the store mutex were missing, -race would fire here —
 // net/http serves every request on its own goroutine by design.
 func TestConcurrentRequestsRaceFree(t *testing.T) {
-	srv, st, _ := newServer(t)
+	srv, st, _, _ := newServer(t)
 	if err := st.Save(store.Record{ID: "hot", Command: []string{"true"}, Status: job.StatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}
@@ -363,4 +383,92 @@ func TestConcurrentRequestsRaceFree(t *testing.T) {
 		resp.Body.Close()
 	}()
 	wg.Wait()
+}
+
+/*
+TestDeleteJobPending pins the happy path: DELETE on a non-terminal job asks
+the canceller and answers 202 with the record as it stands. Cancellation is
+asynchronous — the body may still say pending.
+*/
+func TestDeleteJobPending(t *testing.T) {
+	srv, st, _, c := newServer(t)
+	if err := st.Save(store.Record{ID: "job1", Command: []string{"sleep", "10"}, Status: job.StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/jobs/job1", nil))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := c.cancelled(); len(got) != 1 || got[0] != "job1" {
+		t.Errorf("canceller saw %v, want [job1]", got)
+	}
+	var body store.Record
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if body.ID != "job1" {
+		t.Errorf("body id = %q, want job1", body.ID)
+	}
+}
+
+/*
+TestDeleteJobTerminal409 pins the state machine: a finished job cannot be
+cancelled, and the canceller is never consulted.
+*/
+func TestDeleteJobTerminal409(t *testing.T) {
+	for _, status := range []job.Status{job.StatusSucceeded, job.StatusFailed, job.StatusCancelled} {
+		t.Run(status.String(), func(t *testing.T) {
+			srv, st, _, c := newServer(t)
+			if err := st.Save(store.Record{ID: "done", Command: []string{"true"}, Status: status}); err != nil {
+				t.Fatal(err)
+			}
+
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/jobs/done", nil))
+
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", rec.Code)
+			}
+			if got := c.cancelled(); len(got) != 0 {
+				t.Errorf("canceller saw %v, want no call for a terminal job", got)
+			}
+		})
+	}
+}
+
+/*
+TestDeleteJobMissing404 pins the not-found contract.
+*/
+func TestDeleteJobMissing404(t *testing.T) {
+	srv, _, _, _ := newServer(t)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/jobs/ghost", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+/*
+TestDeleteJobRunning202 pins that a running record is cancellable too.
+*/
+func TestDeleteJobRunning202(t *testing.T) {
+	srv, st, _, c := newServer(t)
+	if err := st.Save(store.Record{ID: "run", Command: []string{"sleep", "10"}, Status: job.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/jobs/run", nil))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if got := c.cancelled(); len(got) != 1 || got[0] != "run" {
+		t.Errorf("canceller saw %v, want [run]", got)
+	}
 }

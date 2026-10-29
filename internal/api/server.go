@@ -1,5 +1,5 @@
 /*
-Package api exposes Forge over HTTP: submit a job, fetch a job.
+Package api exposes Forge over HTTP: submit a job, fetch a job, cancel a job.
 
 Handlers never run jobs — POST saves a pending record, hands it to the
 queue, and answers 202 immediately; the worker goroutine started by
@@ -25,13 +25,23 @@ import (
 /*
 Server is the HTTP front end. It holds only the collaborators every
 handler needs: the queue jobs are handed to, the store their records
-live in, and the server's lifecycle context. It never runs anything —
-V2 moved execution to the worker.
+live in, the server's lifecycle context, and the canceller V4's DELETE
+route asks to stop a job.
 */
 type Server struct {
 	q   *queue.Queue
 	st  *store.Store
 	ctx context.Context
+	c   Canceller
+}
+
+/*
+Canceller is the seam between HTTP and execution (the worker implements it).
+Defined here, where it is consumed, and deliberately tiny: the API only asks
+"stop this job", never how.
+*/
+type Canceller interface {
+	Cancel(id string)
 }
 
 /*
@@ -44,8 +54,8 @@ down). It is not a request's context: http.Server.Shutdown waits for
 active requests but never cancels them, so Enqueue needs both signals —
 see createJob.
 */
-func New(ctx context.Context, q *queue.Queue, st *store.Store) *Server {
-	return &Server{q: q, st: st, ctx: ctx}
+func New(ctx context.Context, q *queue.Queue, st *store.Store, c Canceller) *Server {
+	return &Server{q: q, st: st, ctx: ctx, c: c}
 }
 
 // Handler returns the routes on a Go 1.22 method+pattern mux: the verb is
@@ -56,6 +66,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /jobs", s.createJob)
+	mux.HandleFunc("DELETE /jobs/{id}", s.cancelJob)
 	return mux
 }
 
@@ -86,6 +97,35 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+/*
+cancelJob asks the worker to stop a job. Cancellation is asynchronous: the
+worker owns the status write, so this answers 202 and leaves the current
+record in the body. A terminal job is a conflict — nothing left to cancel.
+*/
+func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	id := r.PathValue("id")
+	rec, err := s.st.Get(id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, err)
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if rec.Status.Terminal() {
+		writeErr(w, http.StatusConflict, fmt.Errorf("api: job %s is already %s", id, rec.Status))
+		return
+	}
+
+	s.c.Cancel(id)
+
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(rec)
 }
 
 // createJob is the V2 core: decode → identify → validate → persist pending
