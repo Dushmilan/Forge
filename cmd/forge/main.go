@@ -92,6 +92,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	addr := fs.String("addr", ":8080", "address to listen on")
 	data := fs.String("data", "data", "directory holding jobs.json")
 	workers := fs.Int("workers", 4, "number of worker goroutines")
+	maxAttempts := fs.Int("max-attempts", 3, "attempts per job")
+	retryBackoff := fs.Duration("retry-backoff", 100*time.Millisecond, "first retry delay (doubles per attempt)")
+	jobTimeout := fs.Duration("job-timeout", 30*time.Second, "per-job deadline")
 	if err := fs.Parse(args); err != nil {
 		return 2 // flag misuse is a usage error, like no-args in run
 	}
@@ -99,11 +102,27 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "forge: -workers must be >= 1")
 		return 2 // a pool of zero would accept 202s and never run them
 	}
+	if *maxAttempts < 1 {
+		fmt.Fprintln(stderr, "forge: -max-attempts must be >= 1")
+		return 2 // zero attempts would accept jobs and never run them
+	}
+	if *retryBackoff <= 0 {
+		fmt.Fprintln(stderr, "forge: -retry-backoff must be > 0")
+		return 2 // a non-positive timer fires immediately: a hot retry loop
+	}
+	if *jobTimeout <= 0 {
+		fmt.Fprintln(stderr, "forge: -job-timeout must be > 0")
+		return 2 // every job would be cancelled the moment it starts
+	}
 
 	var e executor.Executor
 	st := store.New(*data)
 	q := queue.New()
-	w := worker.New(st, e, worker.Config{MaxAttempts: 3, Backoff: 100 * time.Millisecond, Timeout: 30 * time.Second}, stderr)
+	w := worker.New(st, e, worker.Config{
+		MaxAttempts: *maxAttempts,
+		Backoff:     *retryBackoff,
+		Timeout:     *jobTimeout,
+	}, stderr)
 	/*
 		One context governs server AND worker pool: the same signal that
 		stops accepting requests also stops every worker loop. Queue.Run

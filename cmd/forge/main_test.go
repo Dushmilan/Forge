@@ -481,3 +481,188 @@ func TestRunServeRunsJobsConcurrently(t *testing.T) {
 		t.Fatal("runServe did not shut down after cancel")
 	}
 }
+
+/*
+TestRunServeInvalidLifetimeFlags pins the usage-error contract for the V4
+knobs. Each value would make the worker nonsensical (zero attempts, an
+immediate backoff loop, an already-expired deadline), so all exit 2.
+*/
+func TestRunServeInvalidLifetimeFlags(t *testing.T) {
+	tests := []struct {
+		flag, val, wantSub string
+	}{
+		{"-max-attempts", "0", "-max-attempts must be >= 1"},
+		{"-max-attempts", "-2", "-max-attempts must be >= 1"},
+		{"-max-attempts", "nope", "invalid value"},
+		{"-retry-backoff", "0s", "-retry-backoff must be > 0"},
+		{"-retry-backoff", "-1s", "-retry-backoff must be > 0"},
+		{"-retry-backoff", "nope", "invalid value"},
+		{"-job-timeout", "0s", "-job-timeout must be > 0"},
+		{"-job-timeout", "-1s", "-job-timeout must be > 0"},
+		{"-job-timeout", "nope", "invalid value"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.flag+"="+tt.val, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runServe(context.Background(), []string{tt.flag, tt.val}, &stdout, &stderr)
+			if code != 2 {
+				t.Errorf("runServe(%s %s) = %d, want 2", tt.flag, tt.val, code)
+			}
+			if !strings.Contains(stderr.String(), tt.wantSub) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// serveAddr starts runServe on an ephemeral port and returns its address plus
+// the exit-code channel. Tests wait on the startup line — no sleeps.
+func serveAddr(t *testing.T, ctx context.Context, args ...string) (string, <-chan int) {
+	t.Helper()
+	out := newLineWriter()
+	code := make(chan int, 1)
+	full := append([]string{"-addr", "127.0.0.1:0", "-data", t.TempDir()}, args...)
+	go func() { code <- runServe(ctx, full, out, io.Discard) }()
+
+	select {
+	case line := <-out.ch:
+		addr := strings.TrimPrefix(line, "listening on ")
+		if addr == line {
+			t.Fatalf("unexpected startup line %q", line)
+		}
+		return addr, code
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe never printed its listening address")
+		return "", nil
+	}
+}
+
+// waitStatus polls GET until want, returning the record. The deadline bounds
+// the observation; the poll interval is not the guarantee.
+func waitStatus(t *testing.T, addr, id string, want job.Status) store.Record {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, err := http.Get("http://" + addr + "/jobs/" + id)
+		if err != nil {
+			t.Fatalf("GET %s: %v", id, err)
+		}
+		var got store.Record
+		decodeErr := json.NewDecoder(r.Body).Decode(&got)
+		r.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("GET %s body: %v", id, decodeErr)
+		}
+		if got.Status == want {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s never reached %v; last status %v (%s)", id, want, got.Status, got.Err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func postJob(t *testing.T, addr, command string) store.Record {
+	t.Helper()
+	resp, err := http.Post("http://"+addr+"/jobs", "application/json", strings.NewReader(command))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	var rec store.Record
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("decode POST: %v", err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST status = %d, want 202", resp.StatusCode)
+	}
+	return rec
+}
+
+/*
+TestRunServeRetriesFailedJob pins the V4 headline end to end: a failing
+command runs exactly MaxAttempts times and is stored failed.
+*/
+func TestRunServeRetriesFailedJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddr(t, ctx, "-workers", "1", "-max-attempts", "2", "-retry-backoff", "1ms", "-job-timeout", "5s")
+
+	rec := postJob(t, addr, `{"command": ["sh", "-c", "exit 1"]}`)
+	got := waitStatus(t, addr, rec.ID, job.StatusFailed)
+	if got.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2", got.Attempts)
+	}
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down")
+	}
+}
+
+/*
+TestRunServeDeleteCancelsRunningJob pins the DELETE path with a real child
+process: the sleep is killed and the record ends cancelled.
+*/
+func TestRunServeDeleteCancelsRunningJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddr(t, ctx, "-workers", "1", "-job-timeout", "30s")
+
+	rec := postJob(t, addr, `{"command": ["sleep", "10"]}`)
+	waitStatus(t, addr, rec.ID, job.StatusRunning)
+
+	req, err := http.NewRequest(http.MethodDelete, "http://"+addr+"/jobs/"+rec.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("DELETE status = %d, want 202", resp.StatusCode)
+	}
+
+	got := waitStatus(t, addr, rec.ID, job.StatusCancelled)
+	if got.Err != "job cancelled" {
+		t.Errorf("Err = %q, want %q", got.Err, "job cancelled")
+	}
+
+	cancel()
+	select {
+	case <-code:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down after the job was cancelled")
+	}
+}
+
+/*
+TestRunServeJobTimeoutCancels pins the deadline path: no client action, the
+job stops itself and is stored cancelled with a timeout message.
+*/
+func TestRunServeJobTimeoutCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddr(t, ctx, "-workers", "1", "-job-timeout", "100ms")
+
+	rec := postJob(t, addr, `{"command": ["sleep", "10"]}`)
+	got := waitStatus(t, addr, rec.ID, job.StatusCancelled)
+	if !strings.Contains(got.Err, "timed out") {
+		t.Errorf("Err = %q, want a timeout message", got.Err)
+	}
+
+	cancel()
+	select {
+	case <-code:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down")
+	}
+}
