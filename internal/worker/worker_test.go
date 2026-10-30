@@ -431,3 +431,63 @@ func TestCancelAfterSuccessLeavesRecord(t *testing.T) {
 		t.Errorf("status = %v, want succeeded — Cancel must not write", rec.Status)
 	}
 }
+
+/*
+TestHandleResumesAttemptBudget pins crash recovery's cost: a record recovered
+at Attempts=1 spends that attempt and continues at 2. Without resuming, a job
+that kills the process would restart its budget on every restart — a crash
+loop with no bound.
+*/
+func TestHandleResumesAttemptBudget(t *testing.T) {
+	calls := 0
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		calls++
+		return executor.Result{Stdout: "ok\n"}, nil
+	})
+	w, st := newWorker(t, r, worker.Config{MaxAttempts: 3, Backoff: time.Millisecond, Timeout: time.Second})
+	if err := st.Save(store.Record{ID: "j-resume", Command: []string{"true"}, Status: job.StatusPending, Attempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Handle(context.Background(), store.Record{ID: "j-resume", Command: []string{"true"}, Status: job.StatusPending, Attempts: 1})
+
+	if calls != 1 {
+		t.Errorf("runner called %d times, want 1 — the recovered attempt already ran", calls)
+	}
+	rec := mustGet(t, st, "j-resume")
+	if rec.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2", rec.Attempts)
+	}
+	if rec.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", rec.Status)
+	}
+}
+
+/*
+TestHandleExhaustedBudgetRunsNothing pins the bound at the handler: even if a
+record reaches a worker with its budget spent, it must not execute again.
+*/
+func TestHandleExhaustedBudgetRunsNothing(t *testing.T) {
+	called := false
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		called = true
+		return executor.Result{}, nil
+	})
+	w, st := newWorker(t, r, worker.Config{MaxAttempts: 2, Backoff: time.Millisecond, Timeout: time.Second})
+	if err := st.Save(store.Record{ID: "j-spent", Command: []string{"true"}, Status: job.StatusPending, Attempts: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Handle(context.Background(), store.Record{ID: "j-spent", Command: []string{"true"}, Status: job.StatusPending, Attempts: 2})
+
+	if called {
+		t.Error("runner ran a record whose attempts were exhausted")
+	}
+	rec := mustGet(t, st, "j-spent")
+	if rec.Status != job.StatusFailed {
+		t.Errorf("status = %v, want failed", rec.Status)
+	}
+	if rec.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2 — no attempt started", rec.Attempts)
+	}
+}

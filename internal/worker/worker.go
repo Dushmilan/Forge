@@ -77,7 +77,20 @@ func (w *Worker) Handle(ctx context.Context, rec store.Record) {
 	}
 	defer release() // unregister only after the final save: Cancel must see the entry until then
 
-	for attempt := 1; attempt <= w.cfg.MaxAttempts; attempt++ {
+	/*
+		The retry budget is persisted, not per-process: recovery requeues an
+		interrupted job with its Attempts intact, so the next attempt must
+		continue the count. A record that arrives already exhausted is a bug
+		in recovery or a stale queue entry; fail it rather than run it.
+	*/
+	if rec.Attempts >= w.cfg.MaxAttempts {
+		rec.Status = job.StatusFailed
+		rec.Err = fmt.Sprintf("job exhausted %d attempt(s)", w.cfg.MaxAttempts)
+		w.save(rec)
+		return
+	}
+
+	for attempt := rec.Attempts + 1; attempt <= w.cfg.MaxAttempts; attempt++ {
 		rec.Attempts = attempt
 		rec.Status = job.StatusRunning
 		if !w.save(rec) {
