@@ -177,7 +177,7 @@ func keyIndex(m map[string]Record) (map[string]string, error) {
 			continue
 		}
 		if other, ok := ids[rec.IdempotencyKey]; ok {
-			return nil, fmt.Errorf("store: duplicate idempotency key %q on jobs %s and %s",
+			return nil, fmt.Errorf("store: duplicate idempotency key %q on jobs %q and %q",
 				rec.IdempotencyKey, other, id)
 		}
 		ids[rec.IdempotencyKey] = id

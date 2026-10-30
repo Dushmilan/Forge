@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -405,5 +406,56 @@ func TestCreateKeySurvivesRestart(t *testing.T) {
 	}
 	if created || got.ID != first.ID {
 		t.Errorf("after restart: created=%v id=%q, want replay of %q", created, got.ID, first.ID)
+	}
+}
+
+/*
+TestSavePreservesIdempotencyKey pins the second half of field ownership: a
+worker saves a record it built from a queue snapshot, and that snapshot must
+not be able to erase the client's key.
+*/
+func TestSavePreservesIdempotencyKey(t *testing.T) {
+	s := store.New(t.TempDir())
+	if _, _, err := s.Create(store.Record{
+		ID: "keyed", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The worker's view: same record, no key, after an attempt.
+	if err := s.Save(store.Record{
+		ID: "keyed", Command: []string{"true"}, Status: job.StatusRunning, Attempts: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get("keyed")
+	if got.IdempotencyKey != "k1" {
+		t.Errorf("IdempotencyKey = %q, want k1 after a worker save", got.IdempotencyKey)
+	}
+}
+
+/*
+TestCreateRejectsDuplicateKeysInFile pins honesty over convenience: a store
+that already contains two records for one key is corrupt, and guessing which
+one "wins" would silently lose a job.
+*/
+func TestCreateRejectsDuplicateKeysInFile(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+  "a": {"id": "a", "command": ["true"], "status": "pending", "idempotency_key": "k1"},
+  "b": {"id": "b", "command": ["true"], "status": "pending", "idempotency_key": "k1"}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := store.New(dir).Create(store.Record{
+		ID: "c", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k2",
+	})
+	if err == nil {
+		t.Fatal("Create(corrupt keys) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), `"a"`) || !strings.Contains(err.Error(), `"b"`) {
+		t.Errorf("error = %v, want it to name both ids", err)
 	}
 }
