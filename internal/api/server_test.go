@@ -472,3 +472,229 @@ func TestDeleteJobRunning202(t *testing.T) {
 		t.Errorf("canceller saw %v, want [run]", got)
 	}
 }
+
+/*
+TestPostJobIdempotentReplay pins the headline contract: the first POST creates
+(202), the second with the same key replays (200), both name one job, and only
+ONE record reaches a worker — a replay must not run the work again.
+*/
+func TestPostJobIdempotentReplay(t *testing.T) {
+	srv, st, q, _ := newServer(t)
+	h := srv.Handler()
+	body := `{"command": ["echo", "hello"]}`
+
+	first := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(first, req)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202 (body: %s)", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(second, req)
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (body: %s)", second.Code, second.Body.String())
+	}
+
+	var a, b store.Record
+	if err := json.Unmarshal(first.Body.Bytes(), &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &b); err != nil {
+		t.Fatal(err)
+	}
+	if a.ID != b.ID {
+		t.Errorf("replay id = %q, want the original %q", b.ID, a.ID)
+	}
+
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Errorf("store holds %d records, want 1", len(all))
+	}
+
+	// A replay must not enqueue: one worker sees one record, then nothing.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan store.Record, 2)
+	go q.Run(ctx, 1, func(_ context.Context, r store.Record) { seen <- r })
+	select {
+	case got := <-seen:
+		if got.ID != a.ID {
+			t.Errorf("worker saw %q, want %q", got.ID, a.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the created record never reached a worker")
+	}
+	select {
+	case got := <-seen:
+		t.Fatalf("the replay reached a worker too: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+/*
+TestPostJobKeyReuseDifferentCommand409 pins the mismatch rule: a key names one
+intent. Reusing it for other work is a client bug, and no second job is made.
+*/
+func TestPostJobKeyReuseDifferentCommand409(t *testing.T) {
+	srv, st, _, _ := newServer(t)
+	h := srv.Handler()
+
+	first := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": ["echo", "one"]}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(first, req)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202", first.Code)
+	}
+
+	second := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": ["echo", "two"]}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(second, req)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", second.Code, second.Body.String())
+	}
+
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Errorf("store holds %d records, want 1", len(all))
+	}
+}
+
+/*
+TestPostJobKeyLengthLimit pins the one key rule: opaque bytes, capped so a
+client cannot grow jobs.json without bound.
+*/
+func TestPostJobKeyLengthLimit(t *testing.T) {
+	srv, st, _, _ := newServer(t)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": ["true"]}`))
+	req.Header.Set("Idempotency-Key", strings.Repeat("x", 256))
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Errorf("stored %d records for an oversize key, want none", len(all))
+	}
+}
+
+/*
+TestPostJobInvalidBodyDoesNotBurnKey pins Review Focus 4: validation runs
+before admission, so a malformed attempt leaves the key unused and a valid
+retry still creates the job.
+*/
+func TestPostJobInvalidBodyDoesNotBurnKey(t *testing.T) {
+	srv, st, _, _ := newServer(t)
+
+	bad := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": []}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	srv.Handler().ServeHTTP(bad, req)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("bad status = %d, want 400", bad.Code)
+	}
+
+	good := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": ["true"]}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	srv.Handler().ServeHTTP(good, req)
+	if good.Code != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202 (body: %s)", good.Code, good.Body.String())
+	}
+
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Errorf("store holds %d records, want the one valid job", len(all))
+	}
+}
+
+/*
+TestPostJobConcurrentDuplicatesOneJob pins the client-visible form of Review
+Focus 1: twenty simultaneous retries of one key yield exactly one 202 and one
+record; every response names the same id.
+*/
+func TestPostJobConcurrentDuplicatesOneJob(t *testing.T) {
+	srv, st, _, _ := newServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	const n = 20
+	ids := make(chan string, n)
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/jobs",
+				strings.NewReader(`{"command": ["true"]}`))
+			if err != nil {
+				t.Errorf("NewRequest: %v", err)
+				return
+			}
+			req.Header.Set("Idempotency-Key", "burst")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("POST: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			var rec store.Record
+			if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+				t.Errorf("decode: %v", err)
+				return
+			}
+			ids <- rec.ID
+			codes <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(codes)
+
+	var accepted int
+	for code := range codes {
+		if code == http.StatusAccepted {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Errorf("%d responses were 202, want exactly 1", accepted)
+	}
+	var want string
+	for id := range ids {
+		if want == "" {
+			want = id
+		}
+		if id != want {
+			t.Errorf("response id = %q, want %q", id, want)
+		}
+	}
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Errorf("store holds %d records, want 1", len(all))
+	}
+}

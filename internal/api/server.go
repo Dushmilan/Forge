@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
@@ -135,6 +136,19 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	/*
+		The key is opaque bytes: no trimming, no case folding. Missing or
+		empty means "no dedupe", which keeps every client written before V6
+		working unchanged. The cap exists so a client cannot grow jobs.json
+		without bound.
+	*/
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > maxIdempotencyKeyLen {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Errorf("api: Idempotency-Key must be at most %d bytes", maxIdempotencyKeyLen))
+		return
+	}
+
 	// Step 1: the body must be the expected JSON shape. A body that will
 	// not decode is a client's mistake (400), never a 500 and never a
 	// panic — json.Decoder returns the problem as an ordinary error.
@@ -166,9 +180,36 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	// Step 4: persist the job's intent BEFORE answering. A pending record
 	// on disk is what makes 202 honest: even if the process dies before
 	// the worker picks the job up, the submission is not lost.
-	rec := store.Record{ID: id, Command: in.Command, Status: job.StatusPending}
-	if err := s.st.Save(rec); err != nil {
+	//
+	// Create is the admission path, not Save: with a key it refuses to make
+	// a second record for the same intent, and the check plus the insert
+	// happen under the store's one lock — two concurrent retries cannot
+	// both create.
+	rec := store.Record{ID: id, Command: in.Command, Status: job.StatusPending, IdempotencyKey: key}
+	stored, created, err := s.st.Create(rec)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !created {
+		/*
+			A replay is the same intent, not a second submission. A different
+			command under one key is a client bug: answer 409 and leave the
+			stored job alone. The 200 says "nothing new was accepted"; the
+			body's status says where the original job stands.
+
+			Return here — before Enqueue. Re-enqueueing could run the job
+			twice when the first enqueue succeeded but its response was lost,
+			and V5's startup recovery already repairs a record that was
+			persisted but never queued.
+		*/
+		if !slices.Equal(stored.Command, in.Command) {
+			writeErr(w, http.StatusConflict,
+				fmt.Errorf("api: Idempotency-Key %q was used with a different command", key))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(stored)
 		return
 	}
 
@@ -191,6 +232,10 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(rec)
 }
+
+// maxIdempotencyKeyLen bounds one record's key. Opaque bytes, but not
+// unbounded: the store's file is the whole database.
+const maxIdempotencyKeyLen = 255
 
 // newID returns 32 hex characters (16 random bytes). It returns an error
 // instead of panicking because AGENTS.md reserves panic for main/init —
