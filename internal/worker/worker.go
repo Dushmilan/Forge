@@ -26,6 +26,9 @@ type Config struct {
 	MaxAttempts int
 	Backoff     time.Duration
 	Timeout     time.Duration
+	// Heartbeat is how often a running attempt refreshes LastHeartbeat.
+	// Zero disables it; runServe always passes a positive value.
+	Heartbeat time.Duration
 }
 
 // Worker is safe for concurrent use by N queue workers. Every shared field
@@ -97,7 +100,9 @@ func (w *Worker) Handle(ctx context.Context, rec store.Record) {
 			return
 		}
 
+		stopHeartbeat := w.startHeartbeat(rec.ID)
 		res, err := w.exec.Run(execCtx, job.Job{ID: rec.ID, Command: rec.Command})
+		stopHeartbeat() // join before the outcome save: no tick may follow the final status
 		rec.Result = res
 		if err == nil {
 			rec.Status = job.StatusSucceeded
@@ -247,10 +252,64 @@ not goroutine-safe.
 */
 func (w *Worker) save(rec store.Record) bool {
 	if err := w.st.Save(rec); err != nil {
-		w.errMu.Lock()
-		defer w.errMu.Unlock()
-		fmt.Fprintf(w.stderr, "forge: save job %s: %v\n", rec.ID, err)
+		w.report(fmt.Errorf("save job %s: %w", rec.ID, err))
 		return false
 	}
 	return true
+}
+
+/*
+report serializes writes to the shared stderr Writer. N workers call this
+concurrently, and an arbitrary io.Writer is not goroutine-safe — V3's rule,
+now shared by save and heartbeat failures.
+*/
+func (w *Worker) report(err error) {
+	w.errMu.Lock()
+	defer w.errMu.Unlock()
+	fmt.Fprintf(w.stderr, "forge: %v\n", err)
+}
+
+/*
+startHeartbeat runs a ticker goroutine that refreshes the record's liveness
+until the returned stop function is called. The returned function closes the
+stop channel AND waits on done: stopping without joining would let one more
+tick land after the caller has saved the final status. Every goroutine gets a
+stop path, and every stop path joins.
+*/
+func (w *Worker) startHeartbeat(id string) func() {
+	if w.cfg.Heartbeat <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(w.cfg.Heartbeat)
+		defer t.Stop() // a ticker is a runtime resource; defer is its ledger entry
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if err := w.st.Heartbeat(id, time.Now()); err != nil {
+					/*
+						ErrNotRunning/ErrNotFound mean the record already ended;
+						that is the normal way a heartbeat retires, not a fault.
+						Anything else is reported once and ends the goroutine:
+						retrying a broken disk every tick would only spam stderr.
+					*/
+					if !errors.Is(err, store.ErrNotRunning) && !errors.Is(err, store.ErrNotFound) {
+						w.report(fmt.Errorf("heartbeat job %s: %w", id, err))
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
 }

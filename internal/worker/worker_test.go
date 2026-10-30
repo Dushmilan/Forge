@@ -491,3 +491,139 @@ func TestHandleExhaustedBudgetRunsNothing(t *testing.T) {
 		t.Errorf("Attempts = %d, want 2 — no attempt started", rec.Attempts)
 	}
 }
+
+// waitHeartbeat polls the store until the record shows a heartbeat. Polling
+// with a deadline is the house alternative to time.Sleep: it synchronizes on
+// the state the test cares about instead of guessing a duration.
+func waitHeartbeat(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec, err := st.Get(id); err == nil && rec.LastHeartbeat != nil {
+			return
+		}
+	}
+	t.Fatalf("no heartbeat recorded for %s before the deadline", id)
+}
+
+/*
+TestHandleHeartbeatsWhileRunning pins the ticker: a job that blocks must keep
+its record visibly alive. The runner waits until the test has observed a
+heartbeat, so the synchronization is the store itself — no sleep.
+*/
+func TestHandleHeartbeatsWhileRunning(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		close(started)
+		<-release
+		return executor.Result{Stdout: "ok\n"}, nil
+	})
+	w, st := newWorker(t, r, worker.Config{
+		MaxAttempts: 1,
+		Timeout:     time.Second,
+		Heartbeat:   5 * time.Millisecond,
+	})
+
+	done := make(chan struct{})
+	go func() {
+		w.Handle(context.Background(), store.Record{ID: "j-beat", Command: []string{"slow"}, Status: job.StatusPending})
+		close(done)
+	}()
+
+	<-started
+	waitHeartbeat(t, st, "j-beat")
+	close(release)
+	waitDone(t, done)
+
+	if rec := mustGet(t, st, "j-beat"); rec.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", rec.Status)
+	}
+}
+
+/*
+TestHandleStopsHeartbeatBeforeFinalSave pins Review Focus 1: the ticker
+goroutine must be joined before the terminal save. After Handle returns, the
+timestamp must freeze — a late tick may only ever touch a running record.
+*/
+func TestHandleStopsHeartbeatBeforeFinalSave(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		close(started)
+		<-release
+		return executor.Result{Stdout: "ok\n"}, nil
+	})
+	w, st := newWorker(t, r, worker.Config{
+		MaxAttempts: 1,
+		Timeout:     time.Second,
+		Heartbeat:   time.Millisecond,
+	})
+
+	done := make(chan struct{})
+	go func() {
+		w.Handle(context.Background(), store.Record{ID: "j-stopbeat", Command: []string{"true"}, Status: job.StatusPending})
+		close(done)
+	}()
+
+	<-started
+	waitHeartbeat(t, st, "j-stopbeat")
+	close(release)
+	waitDone(t, done)
+	first := mustGet(t, st, "j-stopbeat")
+
+	// Several intervals later, a leaked goroutine would have advanced the
+	// timestamp. The timer is a deadline, not a sleep used for ordering.
+	<-time.After(20 * time.Millisecond)
+	second := mustGet(t, st, "j-stopbeat")
+	if !second.LastHeartbeat.Equal(*first.LastHeartbeat) {
+		t.Errorf("heartbeat advanced after Handle returned: %v -> %v", first.LastHeartbeat, second.LastHeartbeat)
+	}
+	if second.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", second.Status)
+	}
+}
+
+/*
+TestHandleSurvivesHeartbeatWriteFailure pins that liveness is best-effort: a
+failing heartbeat is reported and must not fail the job.
+*/
+func TestHandleSurvivesHeartbeatWriteFailure(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New(filepath.Join(blocker, "data"))
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		return executor.Result{}, nil
+	})
+	var stderr bytes.Buffer
+	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second, Heartbeat: time.Millisecond}, &stderr)
+
+	w.Handle(context.Background(), store.Record{ID: "j-hbfail", Command: []string{"true"}, Status: job.StatusPending})
+
+	if !strings.Contains(stderr.String(), "j-hbfail") {
+		t.Errorf("stderr = %q, want the heartbeat failure reported", stderr.String())
+	}
+}
+
+/*
+TestHeartbeatRacesFinalSave drives a fast ticker against a fast runner under
+-race. The terminal status must be the last word; the store's mutex plus field
+ownership is what makes that true.
+*/
+func TestHeartbeatRacesFinalSave(t *testing.T) {
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		return executor.Result{}, nil
+	})
+	w, st := newWorker(t, r, worker.Config{MaxAttempts: 1, Timeout: time.Second, Heartbeat: time.Microsecond})
+
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("j-race-%d", i)
+		w.Handle(context.Background(), store.Record{ID: id, Command: []string{"true"}, Status: job.StatusPending})
+		rec := mustGet(t, st, id)
+		if rec.Status != job.StatusSucceeded {
+			t.Fatalf("%s status = %v, want succeeded", id, rec.Status)
+		}
+	}
+}
