@@ -227,6 +227,13 @@ POST /jobs  Idempotency-Key: order-42
 - Keys never expire and are never normalized. The CLI and `DELETE` are
   unchanged.
 
+The guarantee is split by boundary, and V6 only claims the first one:
+
+| | Guarantee |
+|---|---|
+| **Creation** (V6) | at-most-once per key: one key, one record, one enqueue |
+| **Execution** (V5) | at-least-once: an interrupted attempt runs again |
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |

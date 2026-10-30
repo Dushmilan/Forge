@@ -495,7 +495,11 @@ func TestConcurrentCreatesOneWinner(t *testing.T) {
 
 	var winners int
 	var id string
+	results := make([]result, 0, n)
 	for r := range out {
+		results = append(results, r)
+	}
+	for _, r := range results {
 		if r.err != nil {
 			t.Fatalf("Create error: %v", r.err)
 		}
@@ -507,6 +511,13 @@ func TestConcurrentCreatesOneWinner(t *testing.T) {
 	if winners != 1 {
 		t.Fatalf("%d creates won, want exactly 1", winners)
 	}
+	// Every loser must have been told which record won: that is what the API
+	// returns to the retrying client.
+	for _, r := range results {
+		if !r.created && r.rec.ID != id {
+			t.Errorf("loser returned id %q, want the winner %q", r.rec.ID, id)
+		}
+	}
 
 	all, err := s.List()
 	if err != nil {
@@ -514,5 +525,78 @@ func TestConcurrentCreatesOneWinner(t *testing.T) {
 	}
 	if len(all) != 1 || all[0].ID != id {
 		t.Errorf("store holds %+v, want only the winner %s", all, id)
+	}
+}
+
+/*
+TestCreateRejectsExistingID pins Create as admission only: it never updates.
+Without this, an id collision could overwrite a record, keep the old key in
+storage, and report the incoming key as created — response, queue and file
+disagreeing at once.
+*/
+func TestCreateRejectsExistingID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{"keyed", "old"},
+		{"unkeyed", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := store.New(dir)
+			if _, _, err := s.Create(store.Record{
+				ID: "x", Command: []string{"one"}, Status: job.StatusPending, IdempotencyKey: tc.key,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, created, err := s.Create(store.Record{
+				ID: "x", Command: []string{"two"}, Status: job.StatusPending, IdempotencyKey: "new",
+			})
+			if err == nil || created {
+				t.Fatalf("Create(existing id) = created=%v err=%v, want a refusal", created, err)
+			}
+
+			after, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Errorf("a refused Create rewrote jobs.json")
+			}
+			got, _ := s.Get("x")
+			if got.Command[0] != "one" || got.IdempotencyKey != tc.key {
+				t.Errorf("stored record = %+v, want the original untouched", got)
+			}
+		})
+	}
+}
+
+/*
+TestSaveCannotCreateKeyedRecord pins the other half of admission: Save is the
+update path. Letting it introduce a new keyed record would bypass Create's
+uniqueness check and duplicate a key without anyone editing the file.
+*/
+func TestSaveCannotCreateKeyedRecord(t *testing.T) {
+	s := store.New(t.TempDir())
+	if _, _, err := s.Create(store.Record{
+		ID: "a", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Save(store.Record{
+		ID: "b", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	})
+	if err == nil {
+		t.Fatal("Save created a second record with an existing key")
+	}
+	if _, gerr := s.Get("b"); !errors.Is(gerr, store.ErrNotFound) {
+		t.Errorf("Get(b) = %v, want ErrNotFound — the refused save wrote nothing", gerr)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -543,7 +544,7 @@ TestPostJobKeyReuseDifferentCommand409 pins the mismatch rule: a key names one
 intent. Reusing it for other work is a client bug, and no second job is made.
 */
 func TestPostJobKeyReuseDifferentCommand409(t *testing.T) {
-	srv, st, _, _ := newServer(t)
+	srv, st, q, _ := newServer(t)
 	h := srv.Handler()
 
 	first := httptest.NewRecorder()
@@ -552,6 +553,10 @@ func TestPostJobKeyReuseDifferentCommand409(t *testing.T) {
 	h.ServeHTTP(first, req)
 	if first.Code != http.StatusAccepted {
 		t.Fatalf("first status = %d, want 202", first.Code)
+	}
+	var original store.Record
+	if err := json.Unmarshal(first.Body.Bytes(), &original); err != nil {
+		t.Fatal(err)
 	}
 
 	second := httptest.NewRecorder()
@@ -567,7 +572,31 @@ func TestPostJobKeyReuseDifferentCommand409(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(all) != 1 {
-		t.Errorf("store holds %d records, want 1", len(all))
+		t.Fatalf("store holds %d records, want 1", len(all))
+	}
+	// A refused reuse must leave the original exactly as it was: the key
+	// still names the first intent, command included.
+	if all[0].ID != original.ID || !slices.Equal(all[0].Command, original.Command) || all[0].Status != original.Status {
+		t.Errorf("stored record = %+v, want the original %+v untouched", all[0], original)
+	}
+
+	// And only the original submission is queued: one worker sees one job.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan store.Record, 2)
+	go q.Run(ctx, 1, func(_ context.Context, r store.Record) { seen <- r })
+	select {
+	case got := <-seen:
+		if got.ID != original.ID || !slices.Equal(got.Command, original.Command) {
+			t.Errorf("worker saw %+v, want the original %+v", got, original)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the original submission never reached a worker")
+	}
+	select {
+	case got := <-seen:
+		t.Fatalf("the 409'd submission reached a worker too: %+v", got)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -639,8 +668,11 @@ func TestPostJobConcurrentDuplicatesOneJob(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	const n = 20
-	ids := make(chan string, n)
-	codes := make(chan int, n)
+	type result struct {
+		code int
+		id   string
+	}
+	out := make(chan result, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -664,31 +696,43 @@ func TestPostJobConcurrentDuplicatesOneJob(t *testing.T) {
 				t.Errorf("decode: %v", err)
 				return
 			}
-			ids <- rec.ID
-			codes <- resp.StatusCode
+			out <- result{resp.StatusCode, rec.ID}
 		}()
 	}
 	wg.Wait()
-	close(ids)
-	close(codes)
+	close(out)
 
-	var accepted int
-	for code := range codes {
-		if code == http.StatusAccepted {
-			accepted++
-		}
+	results := make([]result, 0, n)
+	for r := range out {
+		results = append(results, r)
 	}
-	if accepted != 1 {
-		t.Errorf("%d responses were 202, want exactly 1", accepted)
+	if len(results) != n {
+		t.Fatalf("got %d responses, want %d", len(results), n)
 	}
+
+	var accepted, replayed int
 	var want string
-	for id := range ids {
+	for _, r := range results {
+		if r.id == "" {
+			t.Error("a response carried no id")
+		}
 		if want == "" {
-			want = id
+			want = r.id
 		}
-		if id != want {
-			t.Errorf("response id = %q, want %q", id, want)
+		if r.id != want {
+			t.Errorf("response id = %q, want %q", r.id, want)
 		}
+		switch r.code {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusOK:
+			replayed++
+		default:
+			t.Errorf("status = %d, want 200 or 202", r.code)
+		}
+	}
+	if accepted != 1 || replayed != n-1 {
+		t.Errorf("got %d accepted and %d replayed, want 1 and %d", accepted, replayed, n-1)
 	}
 	all, err := st.List()
 	if err != nil {
@@ -696,5 +740,39 @@ func TestPostJobConcurrentDuplicatesOneJob(t *testing.T) {
 	}
 	if len(all) != 1 {
 		t.Errorf("store holds %d records, want 1", len(all))
+	}
+}
+
+/*
+TestPostJobTrailingJSONRejected pins "the whole body is the document": one
+decoded value followed by garbage is a malformed request, not a valid job.
+It must not create a record or bind the key, so a corrected retry still works.
+*/
+func TestPostJobTrailingJSONRejected(t *testing.T) {
+	srv, st, _, _ := newServer(t)
+	h := srv.Handler()
+
+	bad := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/jobs",
+		strings.NewReader(`{"command": ["echo", "hi"]} garbage`))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(bad, req)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", bad.Code, bad.Body.String())
+	}
+	all, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("stored %d records for a malformed body, want none", len(all))
+	}
+
+	good := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command": ["echo", "hi"]}`))
+	req.Header.Set("Idempotency-Key", "k1")
+	h.ServeHTTP(good, req)
+	if good.Code != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202 — the key must not be burned", good.Code)
 	}
 }

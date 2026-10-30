@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 
@@ -155,8 +156,19 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Command []string `json:"command"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("api: bad request body: %w", err))
+		return
+	}
+	/*
+		One Decode reads one JSON value and stops; `{"command": [...]} junk`
+		would otherwise be accepted. A second Decode must report io.EOF —
+		anything else means there was a second document, or trailing
+		garbage, and the whole body was not the request.
+	*/
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("api: bad request body: expected one JSON object"))
 		return
 	}
 

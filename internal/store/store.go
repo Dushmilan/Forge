@@ -126,6 +126,15 @@ func (s *Store) Save(r Record) error {
 	if err != nil {
 		return err
 	}
+	/*
+		Save is the update path. A new keyed record must go through Create,
+		or it would bypass the uniqueness check and quietly duplicate a key.
+		Unkeyed seeds stay allowed: that is how V1–V5 tests and direct setup
+		build a store.
+	*/
+	if _, exists := m[r.ID]; !exists && r.IdempotencyKey != "" {
+		return fmt.Errorf("store: job %q: Save cannot create a keyed record; use Create", r.ID)
+	}
 	return s.insertLocked(m, r)
 }
 
@@ -149,6 +158,15 @@ func (s *Store) Create(r Record) (Record, bool, error) {
 	m, err := s.load()
 	if err != nil {
 		return Record{}, false, err
+	}
+	/*
+		Create never updates: an id that already exists is a caller bug, and
+		overwriting it here would let a keyed admission silently replace a
+		record while keeping the old key — response, queue and file
+		disagreeing at once. Updates belong to Save.
+	*/
+	if _, exists := m[r.ID]; exists {
+		return Record{}, false, fmt.Errorf("store: job %q already exists", r.ID)
 	}
 	if r.IdempotencyKey != "" {
 		ids, err := keyIndex(m)
