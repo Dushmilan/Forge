@@ -143,3 +143,36 @@ func TestStatusTerminal(t *testing.T) {
 		}
 	}
 }
+
+/*
+TestStatusCanTransition pins the lifecycle as one table. same→same is legal
+because a worker re-saves running on every attempt; terminal statuses accept
+nothing different; recovery is the only edge that moves running backwards.
+*/
+func TestStatusCanTransition(t *testing.T) {
+	tests := []struct {
+		name string
+		from job.Status
+		to   job.Status
+		want bool
+	}{
+		{"pending to running", job.StatusPending, job.StatusRunning, true},
+		{"pending to cancelled", job.StatusPending, job.StatusCancelled, true},
+		{"pending to succeeded", job.StatusPending, job.StatusSucceeded, false},
+		{"running to succeeded", job.StatusRunning, job.StatusSucceeded, true},
+		{"running to failed", job.StatusRunning, job.StatusFailed, true},
+		{"running to cancelled", job.StatusRunning, job.StatusCancelled, true},
+		{"running to pending", job.StatusRunning, job.StatusPending, true},
+		{"running to itself", job.StatusRunning, job.StatusRunning, true},
+		{"succeeded to running", job.StatusSucceeded, job.StatusRunning, false},
+		{"failed to pending", job.StatusFailed, job.StatusPending, false},
+		{"cancelled to succeeded", job.StatusCancelled, job.StatusSucceeded, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.from.CanTransition(tt.to); got != tt.want {
+				t.Errorf("%v.CanTransition(%v) = %v, want %v", tt.from, tt.to, got, tt.want)
+			}
+		})
+	}
+}

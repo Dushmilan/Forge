@@ -14,6 +14,14 @@ import (
 // invalid job?" with errors.Is, instead of matching on error text.
 var ErrInvalidJob = errors.New("invalid job")
 
+/*
+ErrInvalidTransition is returned, wrapped, when a caller tries to move a
+Status somewhere the lifecycle does not allow. Like ErrInvalidJob it is a
+sentinel so errors.Is can answer "was this a state-machine violation?"
+without matching text.
+*/
+var ErrInvalidTransition = errors.New("job: invalid status transition")
+
 // Status is a named type over int describing where a Job is in its lifecycle.
 //
 // Making it a named type (rather than a bare int) means the compiler refuses
@@ -103,6 +111,37 @@ func (s Status) Terminal() bool {
 	default:
 		return false
 	}
+}
+
+/*
+transitions is the state machine as data. A map of legal destinations beats a
+switch in every call site: one place to read the lifecycle, one place to test
+it. Same→same is handled by CanTransition, not listed here, because an
+idempotent re-save is true for every status.
+*/
+var transitions = map[Status]map[Status]bool{
+	StatusPending: {
+		StatusRunning:   true,
+		StatusCancelled: true,
+	},
+	StatusRunning: {
+		StatusSucceeded: true,
+		StatusFailed:    true,
+		StatusCancelled: true,
+		StatusPending:   true, // recovery: interrupted by a restart
+	},
+}
+
+/*
+CanTransition reports whether s may become to. Reading a missing map key
+returns the zero value (false) — Go makes "not allowed" the default, which is
+the safe direction for a state machine.
+*/
+func (s Status) CanTransition(to Status) bool {
+	if s == to {
+		return true
+	}
+	return transitions[s][to]
 }
 
 // Job is a unit of work: what to run, plus the state it is in.
