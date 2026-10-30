@@ -12,7 +12,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
@@ -22,6 +24,11 @@ import (
 // the id keeps the message human-readable while preserving identity — the
 // same %w idiom V0's job.ErrInvalidJob uses.
 var ErrNotFound = errors.New("store: not found")
+
+// ErrNotRunning is returned by Heartbeat when the record exists but is no
+// longer running: the caller's tick arrived after the job ended. It is a
+// sentinel because "stop heartbeating" is a normal outcome, not a failure.
+var ErrNotRunning = errors.New("store: job not running")
 
 // Record is a Job's persisted life story: what was asked for, where it ended
 // up, and what came back. Err is a string (not error) because it must
@@ -35,6 +42,13 @@ type Record struct {
 	// Attempts counts executions started. A retried job ends with more than
 	// one; a job cancelled before it ever started stays at zero.
 	Attempts int `json:"attempts,omitempty"`
+	/*
+		A pointer, not time.Time: nil means "this job has never run" and is
+		omitted from JSON, while a zero time.Time would serialize as
+		0001-01-01T00:00:00Z on every pending job. encoding/json follows the
+		pointer, so the field is both honest and absent when unknown.
+	*/
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
 }
 
 // Store reads and writes <dir>/jobs.json. The zero construction is New;
@@ -110,9 +124,29 @@ func (s *Store) Save(r Record) error {
 			return fmt.Errorf("store: job %q: %w: %s -> %s",
 				r.ID, job.ErrInvalidTransition, cur.Status, r.Status)
 		}
+		/*
+			Field ownership: the worker persists whole records but never
+			knows the heartbeat; Heartbeat is the only writer. Taking the
+			stored value when the incoming one is nil is what keeps a
+			whole-record save from rewinding liveness — the same reason the
+			store exists instead of two goroutines racing on one struct.
+		*/
+		if r.LastHeartbeat == nil {
+			r.LastHeartbeat = cur.LastHeartbeat
+		}
 	}
 	m[r.ID] = r
 
+	return s.writeLocked(m)
+}
+
+/*
+writeLocked persists the whole map. The suffix documents the locking contract:
+every caller already holds s.mu, so two writers can never interleave a read,
+a modify, and a write. tmp+rename is the atomicity: a crash leaves the old
+file, never a half-written one.
+*/
+func (s *Store) writeLocked(m map[string]Record) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("store: encode: %w", err)
@@ -125,6 +159,51 @@ func (s *Store) Save(r Record) error {
 		return fmt.Errorf("store: rename: %w", err)
 	}
 	return nil
+}
+
+/*
+Heartbeat advances one record's liveness without touching status, result, or
+attempts. It exists so the heartbeat goroutine and the worker never write the
+same fields: two writers, one mutex, no lost update.
+*/
+func (s *Store) Heartbeat(id string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	m, err := s.load()
+	if err != nil {
+		return err
+	}
+	r, ok := m[id]
+	if !ok {
+		return fmt.Errorf("store: job %q: %w", id, ErrNotFound)
+	}
+	if r.Status != job.StatusRunning {
+		return fmt.Errorf("store: job %q is %s: %w", id, r.Status, ErrNotRunning)
+	}
+	r.LastHeartbeat = &at
+	m[id] = r
+	return s.writeLocked(m)
+}
+
+/*
+List returns a deterministic snapshot. sort.Slice is deliberate: Go randomizes
+map iteration, and recovery must repair records in the same order every run.
+*/
+func (s *Store) List() ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	m, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Record, 0, len(m))
+	for _, r := range m {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 // Get returns the record for id, or a wrapped ErrNotFound.
