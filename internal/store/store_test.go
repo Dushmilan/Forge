@@ -107,3 +107,54 @@ func TestConcurrentSaves(t *testing.T) {
 		}
 	}
 }
+
+/*
+TestSaveRejectsIllegalTransition pins the state machine at the write: a
+finished job may not run again, the error wraps the sentinel, and the file is
+untouched — a rejected write must not partially apply.
+*/
+func TestSaveRejectsIllegalTransition(t *testing.T) {
+	dir := t.TempDir()
+	s := store.New(dir)
+	if err := s.Save(store.Record{ID: "done", Status: job.StatusSucceeded}); err != nil {
+		t.Fatalf("seed Save() error: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.Save(store.Record{ID: "done", Status: job.StatusRunning})
+	if !errors.Is(err, job.ErrInvalidTransition) {
+		t.Fatalf("Save(succeeded→running) = %v, want wrapped ErrInvalidTransition", err)
+	}
+
+	after, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("jobs.json changed after a rejected transition:\nbefore %s\nafter  %s", before, after)
+	}
+	if got, _ := store.New(dir).Get("done"); got.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", got.Status)
+	}
+}
+
+/*
+TestSaveAllowsRecoveryTransition pins the one backwards edge: running →
+pending is how a restart requeues an interrupted job. Without it, recovery
+could not write its own repair.
+*/
+func TestSaveAllowsRecoveryTransition(t *testing.T) {
+	s := store.New(t.TempDir())
+	if err := s.Save(store.Record{ID: "orphan", Status: job.StatusRunning, Attempts: 1}); err != nil {
+		t.Fatalf("seed Save() error: %v", err)
+	}
+	if err := s.Save(store.Record{ID: "orphan", Status: job.StatusPending, Attempts: 1}); err != nil {
+		t.Fatalf("Save(running→pending) = %v, want nil", err)
+	}
+	if got, _ := s.Get("orphan"); got.Status != job.StatusPending {
+		t.Errorf("status = %v, want pending", got.Status)
+	}
+}

@@ -97,6 +97,20 @@ func (s *Store) Save(r Record) error {
 	if err != nil {
 		return err
 	}
+	/*
+		The state machine is checked where the transition becomes durable.
+		Reading the stored record inside the same lock as the write is what
+		makes the check atomic: no caller can slip a different status in
+		between validation and persistence. A record that does not exist yet
+		is a seed, not a transition — V1's tests and direct test setup save
+		terminal records first.
+	*/
+	if cur, ok := m[r.ID]; ok {
+		if !cur.Status.CanTransition(r.Status) {
+			return fmt.Errorf("store: job %q: %w: %s -> %s",
+				r.ID, job.ErrInvalidTransition, cur.Status, r.Status)
+		}
+	}
 	m[r.ID] = r
 
 	b, err := json.MarshalIndent(m, "", "  ")
