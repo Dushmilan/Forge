@@ -777,3 +777,117 @@ func TestRunServeBindsBeforeRunningRecoveredJobs(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// postKeyed submits with an Idempotency-Key and returns the status code and
+// the record the server answered with.
+func postKeyed(t *testing.T, addr, key, command string) (int, store.Record) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/jobs", strings.NewReader(command))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	var rec store.Record
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("POST body: %v", err)
+	}
+	return resp.StatusCode, rec
+}
+
+/*
+TestRunServeReplaysIdempotentSubmission pins the contract end to end: the
+command's side effect happens once, and the retry gets 200 with the original
+id. Counting lines in a marker file proves execution, which the status alone
+cannot.
+*/
+func TestRunServeReplaysIdempotentSubmission(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "runs")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddrData(t, ctx, t.TempDir(), "-workers", "1", "-job-timeout", "5s")
+
+	body := `{"command": ["sh", "-c", "echo run >> ` + marker + `"]}`
+	firstCode, first := postKeyed(t, addr, "once", body)
+	if firstCode != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202", firstCode)
+	}
+	got := waitStatus(t, addr, first.ID, job.StatusSucceeded)
+
+	secondCode, second := postKeyed(t, addr, "once", body)
+	if secondCode != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200", secondCode)
+	}
+	if second.ID != got.ID {
+		t.Errorf("replay id = %q, want %q", second.ID, first.ID)
+	}
+
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if lines := strings.Count(string(b), "run\n"); lines != 1 {
+		t.Errorf("command ran %d time(s), want 1", lines)
+	}
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down")
+	}
+}
+
+/*
+TestRunServeReplaySurvivesRestart pins durability at the process boundary: a
+new serve over the same data directory answers the retry with the original
+terminal record and does not run the command again.
+*/
+func TestRunServeReplaySurvivesRestart(t *testing.T) {
+	data := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "runs")
+	body := `{"command": ["sh", "-c", "echo run >> ` + marker + `"]}`
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	addr1, code1 := serveAddrData(t, ctx1, data, "-workers", "1", "-job-timeout", "5s")
+	firstCode, first := postKeyed(t, addr1, "once", body)
+	if firstCode != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202", firstCode)
+	}
+	done := waitStatus(t, addr1, first.ID, job.StatusSucceeded)
+	cancel1()
+	select {
+	case <-code1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first serve did not shut down")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	addr2, code2 := serveAddrData(t, ctx2, data, "-workers", "1", "-job-timeout", "5s")
+	defer func() { cancel2(); <-code2 }()
+
+	secondCode, second := postKeyed(t, addr2, "once", body)
+	if secondCode != http.StatusOK {
+		t.Fatalf("replay after restart = %d, want 200", secondCode)
+	}
+	if second.ID != done.ID || second.Status != job.StatusSucceeded {
+		t.Errorf("replay = %+v, want the original succeeded record %s", second, done.ID)
+	}
+
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if lines := strings.Count(string(b), "run\n"); lines != 1 {
+		t.Errorf("command ran %d time(s) across the restart, want 1", lines)
+	}
+}
