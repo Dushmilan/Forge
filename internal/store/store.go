@@ -49,6 +49,12 @@ type Record struct {
 		pointer, so the field is both honest and absent when unknown.
 	*/
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	/*
+		IdempotencyKey is the client's identity for this submission. Opaque
+		bytes: no trimming, no normalization. omitempty keeps every file
+		written before V6 byte-identical, so old stores load unchanged.
+	*/
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // Store reads and writes <dir>/jobs.json. The zero construction is New;
@@ -120,31 +126,92 @@ func (s *Store) Save(r Record) error {
 	if err != nil {
 		return err
 	}
-	/*
-		The state machine is checked where the transition becomes durable.
-		Reading the stored record inside the same lock as the write is what
-		makes the check atomic: no caller can slip a different status in
-		between validation and persistence. A record that does not exist yet
-		is a seed, not a transition — V1's tests and direct test setup save
-		terminal records first.
-	*/
+	return s.insertLocked(m, r)
+}
+
+/*
+Create inserts r unless a stored record already carries its key. It is the
+admission path (POST /jobs asks "may this become a record?"); Save stays the
+update path for records that already exist.
+
+The check and the insert share s.mu, so two concurrent duplicates cannot both
+observe "key absent" and both write: the loser sees the winner's record. The
+index is derived from the loaded map rather than stored beside it, which keeps
+jobs.json a single atomic write at the cost of an O(n) scan per keyed submit.
+*/
+func (s *Store) Create(r Record) (Record, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return Record{}, false, fmt.Errorf("store: create %s: %w", s.dir, err)
+	}
+	m, err := s.load()
+	if err != nil {
+		return Record{}, false, err
+	}
+	if r.IdempotencyKey != "" {
+		ids, err := keyIndex(m)
+		if err != nil {
+			return Record{}, false, err
+		}
+		if id, ok := ids[r.IdempotencyKey]; ok {
+			return m[id], false, nil
+		}
+	}
+	if err := s.insertLocked(m, r); err != nil {
+		return Record{}, false, err
+	}
+	return r, true, nil
+}
+
+/*
+keyIndex derives key → id from the records. Building a map is what makes a
+duplicate visible: two records claiming one key is corruption, and reporting
+both ids is the only answer that does not silently drop a job.
+*/
+func keyIndex(m map[string]Record) (map[string]string, error) {
+	ids := make(map[string]string, len(m))
+	for id, rec := range m {
+		if rec.IdempotencyKey == "" {
+			continue
+		}
+		if other, ok := ids[rec.IdempotencyKey]; ok {
+			return nil, fmt.Errorf("store: duplicate idempotency key %q on jobs %s and %s",
+				rec.IdempotencyKey, other, id)
+		}
+		ids[rec.IdempotencyKey] = id
+	}
+	return ids, nil
+}
+
+/*
+insertLocked validates and stores r, then writes once. Save and Create both
+funnel through here so the state machine and the field-ownership rules exist
+in exactly one place.
+
+The state machine is checked where the transition becomes durable: the stored
+record is read inside the same critical section as the write, so no caller can
+slip a different status in between validation and persistence. A record that
+does not exist yet is a seed, not a transition — V1's tests and direct test
+setup save terminal records first.
+*/
+func (s *Store) insertLocked(m map[string]Record, r Record) error {
 	if cur, ok := m[r.ID]; ok {
 		if !cur.Status.CanTransition(r.Status) {
 			return fmt.Errorf("store: job %q: %w: %s -> %s",
 				r.ID, job.ErrInvalidTransition, cur.Status, r.Status)
 		}
 		/*
-			Field ownership: the worker persists whole records but never owns
-			the heartbeat, so Save always takes the stored value. Preserving
-			it only when the incoming one is nil is not enough — a recovered
-			record carries an older non-nil timestamp, and copying that would
-			rewind liveness at every attempt boundary. Only Heartbeat writes
-			this field; Save's job is to leave it alone.
+			Field ownership: Save carries whole records from the worker and
+			recovery, so it must never write the two fields it does not own.
+			A stale snapshot that predates the heartbeat or the key would
+			otherwise erase liveness or identity.
 		*/
 		r.LastHeartbeat = cur.LastHeartbeat
+		r.IdempotencyKey = cur.IdempotencyKey
 	}
 	m[r.ID] = r
-
 	return s.writeLocked(m)
 }
 

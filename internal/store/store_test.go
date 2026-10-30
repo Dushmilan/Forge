@@ -308,3 +308,102 @@ func TestNullFileFailsLoudly(t *testing.T) {
 		t.Error("Save(null) = nil, want an error instead of a panic")
 	}
 }
+
+/*
+TestCreateDedupesByKey pins the headline: the second submission with a key is
+not a second job. It returns the stored record, reports created=false, and
+leaves the file byte-identical — a replay must not rewrite anything.
+*/
+func TestCreateDedupesByKey(t *testing.T) {
+	dir := t.TempDir()
+	s := store.New(dir)
+
+	first, created, err := s.Create(store.Record{
+		ID: "first", Command: []string{"echo", "hi"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	})
+	if err != nil || !created {
+		t.Fatalf("Create(first) = %v, created=%v, want created", err, created)
+	}
+
+	before, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, created, err := s.Create(store.Record{
+		ID: "second", Command: []string{"echo", "hi"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	})
+	if err != nil {
+		t.Fatalf("Create(second) error: %v", err)
+	}
+	if created {
+		t.Fatal("Create(second) created a record, want a replay")
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay id = %q, want %q", second.ID, first.ID)
+	}
+
+	after, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("a replay rewrote jobs.json:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+/*
+TestCreateKeyRules pins the key's scope: distinct keys are distinct jobs, and
+an empty key means "no dedupe" — the V1–V5 behaviour every old client gets.
+*/
+func TestCreateKeyRules(t *testing.T) {
+	s := store.New(t.TempDir())
+
+	for _, tt := range []struct {
+		id, key string
+	}{
+		{"a", "k1"},
+		{"b", "k2"},
+		{"c", ""},
+		{"d", ""},
+	} {
+		_, created, err := s.Create(store.Record{
+			ID: tt.id, Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: tt.key,
+		})
+		if err != nil || !created {
+			t.Fatalf("Create(%s, key=%q) = %v, created=%v, want created", tt.id, tt.key, err, created)
+		}
+	}
+
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Errorf("stored %d records, want 4 (empty keys never dedupe)", len(got))
+	}
+}
+
+/*
+TestCreateKeySurvivesRestart pins durability: the index is derived from disk,
+so a new process must find the same key. Without this, a crash would reset
+idempotency to "everything is new again".
+*/
+func TestCreateKeySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	first, _, err := store.New(dir).Create(store.Record{
+		ID: "first", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, created, err := store.New(dir).Create(store.Record{
+		ID: "second", Command: []string{"true"}, Status: job.StatusPending, IdempotencyKey: "k1",
+	})
+	if err != nil {
+		t.Fatalf("Create after restart: %v", err)
+	}
+	if created || got.ID != first.ID {
+		t.Errorf("after restart: created=%v id=%q, want replay of %q", created, got.ID, first.ID)
+	}
+}
