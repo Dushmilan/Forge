@@ -3,6 +3,7 @@ package store_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -457,5 +458,61 @@ func TestCreateRejectsDuplicateKeysInFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `"a"`) || !strings.Contains(err.Error(), `"b"`) {
 		t.Errorf("error = %v, want it to name both ids", err)
+	}
+}
+
+/*
+TestConcurrentCreatesOneWinner pins Review Focus 1: N clients retrying the
+same key at once must produce one record. The mutex is the guarantee; -race is
+the proof that the derived index is not read outside it.
+*/
+func TestConcurrentCreatesOneWinner(t *testing.T) {
+	s := store.New(t.TempDir())
+
+	const n = 10
+	type result struct {
+		rec     store.Record
+		created bool
+		err     error
+	}
+	out := make(chan result, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec, created, err := s.Create(store.Record{
+				ID:             fmt.Sprintf("j%d", i),
+				Command:        []string{"true"},
+				Status:         job.StatusPending,
+				IdempotencyKey: "same",
+			})
+			out <- result{rec, created, err}
+		}(i)
+	}
+	wg.Wait()
+	close(out)
+
+	var winners int
+	var id string
+	for r := range out {
+		if r.err != nil {
+			t.Fatalf("Create error: %v", r.err)
+		}
+		if r.created {
+			winners++
+			id = r.rec.ID
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d creates won, want exactly 1", winners)
+	}
+
+	all, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].ID != id {
+		t.Errorf("store holds %+v, want only the winner %s", all, id)
 	}
 }
