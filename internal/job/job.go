@@ -123,6 +123,7 @@ var transitions = map[Status]map[Status]bool{
 	StatusPending: {
 		StatusRunning:   true,
 		StatusCancelled: true,
+		StatusFailed:    true, // an exhausted budget fails before any attempt starts
 	},
 	StatusRunning: {
 		StatusSucceeded: true,

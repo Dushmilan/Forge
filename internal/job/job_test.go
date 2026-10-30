@@ -158,6 +158,7 @@ func TestStatusCanTransition(t *testing.T) {
 	}{
 		{"pending to running", job.StatusPending, job.StatusRunning, true},
 		{"pending to cancelled", job.StatusPending, job.StatusCancelled, true},
+		{"pending to failed", job.StatusPending, job.StatusFailed, true},
 		{"pending to succeeded", job.StatusPending, job.StatusSucceeded, false},
 		{"running to succeeded", job.StatusRunning, job.StatusSucceeded, true},
 		{"running to failed", job.StatusRunning, job.StatusFailed, true},
