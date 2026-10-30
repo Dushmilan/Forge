@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V5 are done. V6–V11 are planned.
+**Status:** V0–V6 are done. V7–V11 are planned.
 
 ## Quick start
 
@@ -31,6 +31,9 @@ go build ./cmd/forge
 
 ```sh
 curl -X POST localhost:8080/jobs -d '{"command": ["echo", "hello"]}'   # 202 + pending record
+curl -X POST localhost:8080/jobs \
+  -H 'Idempotency-Key: order-42' \
+  -d '{"command": ["echo", "hello"]}'       # 202; retry the same key -> 200, same id
 curl localhost:8080/jobs/<id>                                          # 200 + record (poll for final status)
 curl -X DELETE localhost:8080/jobs/<id>                                # 202: cancel queued or running
 ```
@@ -47,7 +50,10 @@ and a restart repairs what the previous process left behind: interrupted jobs
 are requeued (spending the attempt they had started), leftover pending jobs run
 again, and a job that has exhausted its budget is failed instead of
 crash-looping. Recovery is at-least-once — a job interrupted after its side
-effect can run again; V6 is the idempotency story.
+effect can run again. As of V6 a submission may carry an `Idempotency-Key`:
+a retry with the same key returns the original job (200) instead of creating a
+second one, so creation is at-most-once per key while execution stays
+at-least-once.
 Every submitted job is persisted to `<data>/jobs.json`.
 
 Run the tests:
@@ -188,6 +194,39 @@ restart, so `forge serve` starts by reconciling it with reality:
   transition table, and `store.Save` rejects anything it does not allow,
   including the recovery-only `running → pending` edge.
 
+## How it works (V6)
+
+A submission carries an optional key, and the store — not the handler — decides
+whether it is new:
+
+```
+POST /jobs  Idempotency-Key: order-42
+      │
+      ├── key > 255 bytes ──────────────▶ 400, nothing stored
+      ├── bad body / bad command ────────▶ 400, key never bound
+      │
+   store.Create(record)  ── one lock: read → derive key→id → maybe write
+      │
+      ├── key is new ────────────────────▶ 202 + record, enqueue
+      └── key already names a record
+              ├── same command ──────────▶ 200 + stored record, NO enqueue
+              └── different command ─────▶ 409, stored job untouched
+```
+
+- [`internal/store`](internal/store) — `Record.IdempotencyKey` (opaque bytes,
+  omitted from JSON when absent) and `Create`, the admission path. The key → id
+  index is derived from the loaded records inside the existing mutex and is
+  never persisted, so `jobs.json` stays one atomic write. `Save` never writes
+  the key, exactly as it never writes `LastHeartbeat`: whole-record saves from
+  the worker cannot erase identity.
+- [`internal/api`](internal/api) — reads the header, validates *before*
+  admitting (a rejected body does not burn its key), and owns the 409 policy.
+  A replay returns before `Enqueue`: double execution is worse than a stall,
+  and V5's startup recovery repairs a record that was persisted but never
+  queued.
+- Keys never expire and are never normalized. The CLI and `DELETE` are
+  unchanged.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
@@ -198,7 +237,7 @@ restart, so `forge serve` starts by reconciling it with reality:
 | V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ✅     |
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ✅     |
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ✅     |
-| V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ⏳     |
+| V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ✅     |
 | V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ⏳     |
 | V8  | Sandboxed execution            | `os/exec`, processes, signals, filesystem        | ⏳     |
 | V9  | Observability                  | `slog`, `expvar`, `pprof`, metrics               | ⏳     |

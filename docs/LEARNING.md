@@ -155,3 +155,37 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V6 — Idempotency
+
+- **Concept:**
+  - A `map` is a *derived index*, not necessarily stored state. The key → id
+    lookup is rebuilt from the durable records on every admission, inside the
+    lock that already serializes writes. Storing the index would add a second
+    structure that can disagree with the records; deriving it means one file,
+    one atomic rename, and no migration.
+  - Check-and-insert is atomic only if the check and the write share the same
+    critical section. `Create` holds `s.mu` across read → index → insert, so
+    two concurrent retries cannot both observe "key absent" and both write.
+    A try-lock or a retry loop would be a workaround for a lock held too
+    narrowly.
+  - `omitempty` is a compatibility tool: a field that is absent from the JSON
+    is absent from every file written before this version, so old stores load
+    unchanged.
+  - "Exactly-once" is a claim about a boundary, not a system. V6 makes
+    *creation* at-most-once per key; V5 keeps *execution* at-least-once.
+    Saying which boundary a guarantee covers is part of the design.
+  - A retry must never re-enqueue. The server cannot distinguish "never
+    queued" from "queued, response lost", so re-enqueueing trades a stall for
+    a double run. Recovery — not retry — is what repairs a lost enqueue.
+  - Validation must precede admission. Otherwise a malformed submission binds
+    its key to nothing, and the client's corrected retry is told its job
+    already exists.
+- **What I built:** `Record.IdempotencyKey`, `store.Create` with a derived
+  key index and one shared `insertLocked`, the `Idempotency-Key` contract on
+  `POST /jobs` (202 new / 200 replay / 409 mismatch / 400 oversize), and
+  end-to-end replay tests that count the command's side effect rather than
+  trusting its status.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_
