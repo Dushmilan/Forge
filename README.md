@@ -5,7 +5,7 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V4 are done. V5–V11 are planned.
+**Status:** V0–V5 are done. V6–V11 are planned.
 
 ## Quick start
 
@@ -25,7 +25,8 @@ any other Unix tool. Called with no arguments it prints usage and exits 2.
 ```sh
 go build ./cmd/forge
 ./forge serve -addr :8080 -data ./data -workers 4 \
-  -max-attempts 3 -retry-backoff 100ms -job-timeout 30s
+  -max-attempts 3 -retry-backoff 100ms -job-timeout 30s \
+  -heartbeat-interval 1s
 ```
 
 ```sh
@@ -41,6 +42,12 @@ a pool of worker goroutines (`-workers`, default 4) drains the queue
 concurrently, so a slow job no longer blocks the ones behind it. As of V4 a
 failed attempt is retried with exponential backoff up to `-max-attempts`, every
 job runs under `-job-timeout`, and `DELETE` cancels a queued or running job.
+As of V5 a running job refreshes `last_heartbeat` every `-heartbeat-interval`,
+and a restart repairs what the previous process left behind: interrupted jobs
+are requeued (spending the attempt they had started), leftover pending jobs run
+again, and a job that has exhausted its budget is failed instead of
+crash-looping. Recovery is at-least-once — a job interrupted after its side
+effect can run again; V6 is the idempotency story.
 Every submitted job is persisted to `<data>/jobs.json`.
 
 Run the tests:
@@ -147,6 +154,40 @@ POST /jobs ──▶ queue ──▶ worker.Handle ──▶ executor.Run(ctx, j
 - [`internal/api`](internal/api) — `DELETE /jobs/{id}` answers 202 (409 if the
   job already ended); cancellation is asynchronous, so poll `GET`.
 
+## How it works (V5)
+
+V5 gives the process a memory. The store is the source of truth across a
+restart, so `forge serve` starts by reconciling it with reality:
+
+```
+                 startup
+                    │
+        recovery.Recover(store)
+                    │
+   pending ─────────┼──▶ requeue
+   running, budget ─┼──▶ pending + interruption note ──▶ requeue
+   running, spent ──┼──▶ failed
+   terminal ────────┴──▶ untouched
+                    │
+              start worker pool, then enqueue the recovered records
+```
+
+- [`internal/recovery`](internal/recovery) — the startup table above. A
+  `running` record is an orphan by definition: this process just started and
+  is the only one allowed to run jobs. Attempts are persisted, so a crash
+  costs one attempt and a job that kills the process ends `failed` instead of
+  looping forever.
+- [`internal/store`](internal/store) — `LastHeartbeat *time.Time` (nil means
+  "never ran"; JSON omits it), `Heartbeat(id, at)` as the single writer, and
+  `List()` for a deterministic snapshot. `Save` preserves a stored heartbeat,
+  so a worker's whole-record save can never rewind liveness.
+- [`internal/worker`](internal/worker) — a `time.Ticker` goroutine refreshes
+  liveness while an attempt runs; it is stopped and joined before the final
+  save, so no tick can land after the terminal status.
+- [`internal/job`](internal/job) — `Status.CanTransition` is an explicit
+  transition table, and `store.Save` rejects anything it does not allow,
+  including the recovery-only `running → pending` edge.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
@@ -156,7 +197,7 @@ POST /jobs ──▶ queue ──▶ worker.Handle ──▶ executor.Run(ctx, j
 | V2  | Queue + worker                 | channels, goroutines, basic worker loop          | ✅     |
 | V3  | Concurrent workers             | `sync`, `WaitGroup`, worker pool, race detector  | ✅     |
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ✅     |
-| V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ⏳     |
+| V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ✅     |
 | V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ⏳     |
 | V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ⏳     |
 | V8  | Sandboxed execution            | `os/exec`, processes, signals, filesystem        | ⏳     |
@@ -180,6 +221,7 @@ Forge/
 │   ├── store/             # JSON file persistence (V1)
 │   ├── queue/             # channel + worker loop (V2)
 │   ├── worker/            # retries, backoff, timeouts, cancellation (V4)
+│   ├── recovery/          # startup reconciliation of orphaned records (V5)
 │   └── api/               # HTTP handlers (V1, async since V2)
 └── docs/
     ├── LEARNING.md        # one entry per version: what Go concept clicked

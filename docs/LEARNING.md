@@ -123,3 +123,35 @@ Template:
 - **What surprised me:** _(you)_
 - **Idiom worth remembering:** _(you)_
 - **Next time:** _(you)_
+
+## V5 — Heartbeats + failure recovery
+
+- **Concept:**
+  - `time.Ticker` is only half a heartbeat: the goroutine that owns the
+    ticker must also be stopped and **joined** before the record's final
+    save. Stopping without waiting leaves one more tick that can land after
+    the terminal status; the join is what makes "the last write wins" true.
+  - Persisted time is a data-model decision. `*time.Time` distinguishes
+    "never ran" (nil, omitted from JSON) from the zero instant, which
+    `time.Time` would silently serialize as `0001-01-01T00:00:00Z` on every
+    pending job.
+  - Field ownership beats one big lock: the worker writes whole records and
+    the ticker writes one timestamp, so `Save` preserves a stored
+    `LastHeartbeat` instead of letting a stale snapshot rewind it. Two
+    writers, two fields, one mutex — no lost update.
+  - A state machine is more useful as a table than as prose:
+    `Status.CanTransition` makes the lifecycle executable, and enforcing it
+    inside `store.Save`'s locked read-modify-write makes an illegal move
+    fail instead of corrupting the file.
+  - Startup reconciliation is its own operation: a `running` record at boot
+    is an orphan by definition, because this process owns the store. The
+    interrupted attempt was already counted, so recovery resumes the budget
+    rather than resetting it — a crash costs one attempt, not the whole job.
+- **What I built:** the `Status.CanTransition` table and
+  `job.ErrInvalidTransition`; `Record.LastHeartbeat`, `store.Heartbeat`, and
+  `store.List`; a heartbeat ticker joined before every outcome save; attempt
+  resumption in `worker.Handle`; the `internal/recovery` startup pass; and
+  `-heartbeat-interval` on `forge serve`.
+- **What surprised me:** _(you)_
+- **Idiom worth remembering:** _(you)_
+- **Next time:** _(you)_
