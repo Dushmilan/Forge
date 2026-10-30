@@ -19,6 +19,7 @@ import (
 	"github.com/Dushmilan/Forge/internal/executor"
 	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
+	"github.com/Dushmilan/Forge/internal/recovery"
 	"github.com/Dushmilan/Forge/internal/store"
 	"github.com/Dushmilan/Forge/internal/worker"
 )
@@ -95,6 +96,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	maxAttempts := fs.Int("max-attempts", 3, "attempts per job")
 	retryBackoff := fs.Duration("retry-backoff", 100*time.Millisecond, "first retry delay (doubles per attempt)")
 	jobTimeout := fs.Duration("job-timeout", 30*time.Second, "per-job deadline")
+	heartbeatInterval := fs.Duration("heartbeat-interval", time.Second, "how often a running job refreshes its heartbeat")
 	if err := fs.Parse(args); err != nil {
 		return 2 // flag misuse is a usage error, like no-args in run
 	}
@@ -114,6 +116,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "forge: -job-timeout must be > 0")
 		return 2 // every job would be cancelled the moment it starts
 	}
+	if *heartbeatInterval <= 0 {
+		fmt.Fprintln(stderr, "forge: -heartbeat-interval must be > 0")
+		return 2 // time.NewTicker panics on a non-positive interval
+	}
 
 	var e executor.Executor
 	st := store.New(*data)
@@ -122,7 +128,20 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		MaxAttempts: *maxAttempts,
 		Backoff:     *retryBackoff,
 		Timeout:     *jobTimeout,
+		Heartbeat:   *heartbeatInterval,
 	}, stderr)
+	/*
+		Recover before any worker exists: the repair must be the only writer
+		while it runs, and the queue must never see a half-repaired record.
+		Starting the pool before enqueuing is the other half: a recovery set
+		larger than the queue's 64-slot buffer would otherwise block the
+		startup goroutine forever with no receiver.
+	*/
+	requeue, err := recovery.Recover(st, recovery.Config{MaxAttempts: *maxAttempts})
+	if err != nil {
+		fmt.Fprintf(stderr, "forge: %v\n", err)
+		return 1 // serving on a store we could not repair would hide the problem
+	}
 	/*
 		One context governs server AND worker pool: the same signal that
 		stops accepting requests also stops every worker loop. Queue.Run
@@ -134,6 +153,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		q.Run(ctx, *workers, w.Handle)
 		close(workerDone) // closing (not just returning) lets the shutdown path JOIN
 	}()
+	if len(requeue) > 0 {
+		fmt.Fprintf(stderr, "forge: recovered %d job(s)\n", len(requeue))
+		for _, rec := range requeue {
+			if err := q.Enqueue(ctx, rec); err != nil {
+				fmt.Fprintf(stderr, "forge: requeue job %s: %v\n", rec.ID, err)
+			}
+		}
+	}
 	srv := &http.Server{
 		Addr:    *addr,
 		Handler: api.New(ctx, q, st, w).Handler(),

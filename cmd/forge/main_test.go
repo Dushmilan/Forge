@@ -500,6 +500,9 @@ func TestRunServeInvalidLifetimeFlags(t *testing.T) {
 		{"-job-timeout", "0s", "-job-timeout must be > 0"},
 		{"-job-timeout", "-1s", "-job-timeout must be > 0"},
 		{"-job-timeout", "nope", "invalid value"},
+		{"-heartbeat-interval", "0s", "-heartbeat-interval must be > 0"},
+		{"-heartbeat-interval", "-1s", "-heartbeat-interval must be > 0"},
+		{"-heartbeat-interval", "nope", "invalid value"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.flag+"="+tt.val, func(t *testing.T) {
@@ -519,9 +522,16 @@ func TestRunServeInvalidLifetimeFlags(t *testing.T) {
 // the exit-code channel. Tests wait on the startup line — no sleeps.
 func serveAddr(t *testing.T, ctx context.Context, args ...string) (string, <-chan int) {
 	t.Helper()
+	return serveAddrData(t, ctx, t.TempDir(), args...)
+}
+
+// serveAddrData is serveAddr with a caller-owned data directory, for tests
+// that must seed the store before the process starts (crash recovery).
+func serveAddrData(t *testing.T, ctx context.Context, data string, args ...string) (string, <-chan int) {
+	t.Helper()
 	out := newLineWriter()
 	code := make(chan int, 1)
-	full := append([]string{"-addr", "127.0.0.1:0", "-data", t.TempDir()}, args...)
+	full := append([]string{"-addr", "127.0.0.1:0", "-data", data}, args...)
 	go func() { code <- runServe(ctx, full, out, io.Discard) }()
 
 	select {
@@ -662,6 +672,60 @@ func TestRunServeJobTimeoutCancels(t *testing.T) {
 	cancel()
 	select {
 	case <-code:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServe did not shut down")
+	}
+}
+
+/*
+TestRunServeRecoversInterruptedJob pins V5's headline: records left behind by
+a dead process are requeued and finish after a restart. The seed IS the crash:
+jobs.json written before serve exists, one record running mid-attempt and one
+still buffered as pending. The interrupted attempt counts, so the orphan
+finishes at attempt 2, not 1.
+*/
+func TestRunServeRecoversInterruptedJob(t *testing.T) {
+	data := t.TempDir()
+	st := store.New(data)
+	if err := st.Save(store.Record{
+		ID:       "orphan",
+		Command:  []string{"echo", "recovered"},
+		Status:   job.StatusRunning,
+		Attempts: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(store.Record{
+		ID:      "queued",
+		Command: []string{"echo", "queued"},
+		Status:  job.StatusPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddrData(t, ctx, data, "-workers", "1", "-max-attempts", "3", "-retry-backoff", "1ms", "-job-timeout", "5s")
+
+	for _, tt := range []struct {
+		id       string
+		attempts int
+	}{
+		{"orphan", 2},
+		{"queued", 1},
+	} {
+		got := waitStatus(t, addr, tt.id, job.StatusSucceeded)
+		if got.Attempts != tt.attempts {
+			t.Errorf("%s Attempts = %d, want %d", tt.id, got.Attempts, tt.attempts)
+		}
+	}
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("runServe() = %d, want 0", c)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runServe did not shut down")
 	}
