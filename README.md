@@ -179,8 +179,8 @@ restart, so `forge serve` starts by reconciling it with reality:
   looping forever.
 - [`internal/store`](internal/store) — `LastHeartbeat *time.Time` (nil means
   "never ran"; JSON omits it), `Heartbeat(id, at)` as the single writer, and
-  `List()` for a deterministic snapshot. `Save` preserves a stored heartbeat,
-  so a worker's whole-record save can never rewind liveness.
+  `List()` for a deterministic snapshot. `Save` never writes a stored
+  heartbeat, so a worker's whole-record save can never rewind liveness.
 - [`internal/worker`](internal/worker) — a `time.Ticker` goroutine refreshes
   liveness while an attempt runs; it is stopped and joined before the final
   save, so no tick can land after the terminal status.

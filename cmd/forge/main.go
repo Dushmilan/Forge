@@ -133,7 +133,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	/*
 		Recover before any worker exists: the repair must be the only writer
 		while it runs, and the queue must never see a half-repaired record.
-		Starting the pool before enqueuing is the other half: a recovery set
+		Binding the listener comes next, before the pool: a serve that cannot
+		bind must fail before a recovered command has a side effect. Starting
+		the pool before enqueuing is the last ordering rule — a recovery set
 		larger than the queue's 64-slot buffer would otherwise block the
 		startup goroutine forever with no receiver.
 	*/
@@ -141,6 +143,19 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if err != nil {
 		fmt.Fprintf(stderr, "forge: %v\n", err)
 		return 1 // serving on a store we could not repair would hide the problem
+	}
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: api.New(ctx, q, st, w).Handler(),
+	}
+
+	// Listen ourselves instead of srv.ListenAndServe() so we can print the
+	// REAL address: with -addr ":0" the OS picked an ephemeral port that
+	// only the listener knows.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fmt.Fprintf(stderr, "forge: %v\n", err)
+		return 1
 	}
 	/*
 		One context governs server AND worker pool: the same signal that
@@ -160,19 +175,6 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 				fmt.Fprintf(stderr, "forge: requeue job %s: %v\n", rec.ID, err)
 			}
 		}
-	}
-	srv := &http.Server{
-		Addr:    *addr,
-		Handler: api.New(ctx, q, st, w).Handler(),
-	}
-
-	// Listen ourselves instead of srv.ListenAndServe() so we can print the
-	// REAL address: with -addr ":0" the OS picked an ephemeral port that
-	// only the listener knows.
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		fmt.Fprintf(stderr, "forge: %v\n", err)
-		return 1
 	}
 	fmt.Fprintf(stdout, "listening on %s\n", ln.Addr())
 

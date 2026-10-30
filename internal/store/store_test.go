@@ -258,3 +258,53 @@ func TestListIsOrderedByID(t *testing.T) {
 		t.Errorf("List() = %+v, want ids a,b,c", got)
 	}
 }
+
+/*
+TestSaveNeverOverwritesHeartbeat pins the ownership rule with the value that
+actually occurs after recovery: the worker's snapshot can carry an OLDER,
+non-nil heartbeat taken from the requeued record. Save must still keep the
+stored value; otherwise every attempt boundary rewinds liveness to the crash
+timestamp, and only Heartbeat may ever advance it.
+*/
+func TestSaveNeverOverwritesHeartbeat(t *testing.T) {
+	s := store.New(t.TempDir())
+	if err := s.Save(store.Record{ID: "live", Status: job.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	newer := time.Date(2026, 10, 30, 12, 0, 1, 0, time.UTC)
+	if err := s.Heartbeat("live", newer); err != nil {
+		t.Fatal(err)
+	}
+
+	older := newer.Add(-time.Minute)
+	if err := s.Save(store.Record{ID: "live", Status: job.StatusRunning, Attempts: 2, LastHeartbeat: &older}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get("live")
+	if got.LastHeartbeat == nil || !got.LastHeartbeat.Equal(newer) {
+		t.Errorf("LastHeartbeat = %v, want the stored %v", got.LastHeartbeat, newer)
+	}
+}
+
+/*
+TestNullFileFailsLoudly pins that a `null` document is corruption, not an
+empty store: encoding/json happily leaves the map nil, and the next Save would
+panic assigning into it. Startup must reject it instead.
+*/
+func TestNullFileFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), []byte("null"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := store.New(dir)
+
+	if _, err := s.List(); err == nil {
+		t.Error("List(null) = nil error, want a corruption error")
+	}
+	if _, err := s.Get("any"); err == nil {
+		t.Error("Get(null) = nil error, want a corruption error")
+	}
+	if err := s.Save(store.Record{ID: "new", Status: job.StatusPending}); err == nil {
+		t.Error("Save(null) = nil, want an error instead of a panic")
+	}
+}

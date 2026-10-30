@@ -87,6 +87,15 @@ func (s *Store) load() (map[string]Record, error) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("store: decode %s: %w", s.path(), err)
 	}
+	/*
+		`null` decodes into a nil map without an error, and the next Save
+		would panic assigning into it. A store must be a JSON object; a nil
+		map is corruption with a misleading "empty" face, so reject it here
+		where the file is read.
+	*/
+	if m == nil {
+		return nil, fmt.Errorf("store: decode %s: expected a JSON object, got null", s.path())
+	}
 	return m, nil
 }
 
@@ -125,15 +134,14 @@ func (s *Store) Save(r Record) error {
 				r.ID, job.ErrInvalidTransition, cur.Status, r.Status)
 		}
 		/*
-			Field ownership: the worker persists whole records but never
-			knows the heartbeat; Heartbeat is the only writer. Taking the
-			stored value when the incoming one is nil is what keeps a
-			whole-record save from rewinding liveness — the same reason the
-			store exists instead of two goroutines racing on one struct.
+			Field ownership: the worker persists whole records but never owns
+			the heartbeat, so Save always takes the stored value. Preserving
+			it only when the incoming one is nil is not enough — a recovered
+			record carries an older non-nil timestamp, and copying that would
+			rewind liveness at every attempt boundary. Only Heartbeat writes
+			this field; Save's job is to leave it alone.
 		*/
-		if r.LastHeartbeat == nil {
-			r.LastHeartbeat = cur.LastHeartbeat
-		}
+		r.LastHeartbeat = cur.LastHeartbeat
 	}
 	m[r.ID] = r
 

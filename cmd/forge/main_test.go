@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -728,5 +729,51 @@ func TestRunServeRecoversInterruptedJob(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runServe did not shut down")
+	}
+}
+
+/*
+TestRunServeBindsBeforeRunningRecoveredJobs pins the startup order: a serve
+that cannot bind must fail before any recovered command has a side effect.
+Recovery is a repair, not permission to execute; jobs may only run once the
+process can actually serve.
+*/
+func TestRunServeBindsBeforeRunningRecoveredJobs(t *testing.T) {
+	occupier, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupier.Close()
+
+	data := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "ran")
+	st := store.New(data)
+	if err := st.Save(store.Record{
+		ID:      "never",
+		Command: []string{"sh", "-c", "touch " + marker},
+		Status:  job.StatusPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runServe(context.Background(), []string{
+		"-addr", occupier.Addr().String(),
+		"-data", data,
+		"-workers", "1",
+		"-job-timeout", "5s",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("runServe() = %d, want 1 on a busy address; stderr %q", code, stderr.String())
+	}
+
+	// A wrongly started worker would run the command moments after the
+	// error. The deadline bounds the observation; 1ms is the poll interval.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatal("job ran even though the server failed to bind")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
