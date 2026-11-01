@@ -72,6 +72,17 @@ func (p *Pool) Acquire(ctx context.Context, names []string) (func(), error) {
 	}
 
 	/*
+		A finished context must never yield capacity, and select alone cannot
+		promise that: when a token is free and ctx is already done, both cases
+		are ready and Go picks one at random. Checking here and again after
+		the loop makes the contract total — the caller's error path, not a
+		recorded attempt, is what a cancelled wait becomes.
+	*/
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, fmt.Errorf("resource: acquire %v: %w", ordered, cerr)
+	}
+
+	/*
 		held records what has been taken so far so the failure path can give
 		it all back. release is safe to call with an empty held slice.
 	*/
@@ -92,6 +103,10 @@ func (p *Pool) Acquire(ctx context.Context, names []string) (func(), error) {
 			release()
 			return nil, fmt.Errorf("resource: acquire %q: %w", name, ctx.Err())
 		}
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		release()
+		return nil, fmt.Errorf("resource: acquire %v: %w", ordered, cerr)
 	}
 	return release, nil
 }

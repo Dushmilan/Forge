@@ -220,8 +220,9 @@ Template:
   lives. It is a **min**-heap, so "highest priority comes out first" means
   comparing with `>`. A heap is not stable, so FIFO inside one priority needs
   a sequence number the record does not otherwise carry. A buffered channel is
-  a counting semaphore — taking a token is a send, releasing is a receive —
-  and a channel of capacity 1 makes a coalescing wakeup signal. Acquiring
+  a counting semaphore — acquiring is a receive from the channel, releasing is
+  a send back into it — and a channel of capacity 1 makes a coalescing wakeup
+  signal. Acquiring
   several resources in one global order is what prevents circular wait.
 - **What I built:** `job.Priority` and `ValidateResources`; `Record.Priority`
   and `Record.Resources` with `omitempty` so V1–V6 files still load;

@@ -148,3 +148,34 @@ func TestConfigured(t *testing.T) {
 		t.Error("Configured(tpu) = true, want false")
 	}
 }
+
+/*
+TestAcquireNeverSucceedsOnFinishedContext pins the total cancellation
+contract: a context that is already done must never yield capacity. The
+repeated calls are the test, not padding — Acquire's select chooses
+pseudo-randomly between a free token and a done context, so a single call
+would pass half the time on the broken version.
+*/
+func TestAcquireNeverSucceedsOnFinishedContext(t *testing.T) {
+	pool := resource.New(map[string]int{"gpu": 1})
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 0; i < 200; i++ {
+		release, err := pool.Acquire(done, []string{"gpu"})
+		if err == nil {
+			release()
+			t.Fatalf("iteration %d: Acquire succeeded on a finished context", i)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("iteration %d: err = %v, want context.Canceled", i, err)
+		}
+	}
+
+	// The refusals must not have consumed the unit.
+	release, err := pool.Acquire(context.Background(), []string{"gpu"})
+	if err != nil {
+		t.Fatalf("Acquire after refusals: %v", err)
+	}
+	release()
+}
