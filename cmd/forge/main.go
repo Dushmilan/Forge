@@ -20,6 +20,7 @@ import (
 	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/recovery"
+	"github.com/Dushmilan/Forge/internal/resource"
 	"github.com/Dushmilan/Forge/internal/store"
 	"github.com/Dushmilan/Forge/internal/worker"
 )
@@ -124,12 +125,13 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	var e executor.Executor
 	st := store.New(*data)
 	q := queue.New()
+	pool := resource.New(nil) // V7 Task 8 replaces this with -resources
 	w := worker.New(st, e, worker.Config{
 		MaxAttempts: *maxAttempts,
 		Backoff:     *retryBackoff,
 		Timeout:     *jobTimeout,
 		Heartbeat:   *heartbeatInterval,
-	}, stderr)
+	}, pool, stderr)
 	/*
 		Recover before any worker exists: the repair must be the only writer
 		while it runs, and the queue must never see a half-repaired record.

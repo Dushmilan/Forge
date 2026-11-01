@@ -31,12 +31,26 @@ type Config struct {
 	Heartbeat time.Duration
 }
 
+/*
+Acquirer is the seam between a job and the scarce capacity it claims.
+
+It is declared here, where it is consumed — the worker needs one method and
+nothing more — and *resource.Pool satisfies it implicitly, so neither package
+imports the other. A test can satisfy it with a few lines.
+*/
+type Acquirer interface {
+	// Acquire takes one unit of every named resource and returns the
+	// release. On error nothing is held and the caller need not release.
+	Acquire(ctx context.Context, names []string) (release func(), err error)
+}
+
 // Worker is safe for concurrent use by N queue workers. Every shared field
 // below is either immutable after New or guarded by a mutex.
 type Worker struct {
 	st     *store.Store
 	exec   executor.Runner
 	cfg    Config
+	acq    Acquirer
 	stderr io.Writer
 
 	errMu sync.Mutex // serializes stderr writes from concurrent workers
@@ -52,12 +66,14 @@ type Worker struct {
 }
 
 // New wires a Worker. cfg is expected to be valid (runServe validates flags
-// before constructing it); tests construct explicit configs.
-func New(st *store.Store, exec executor.Runner, cfg Config, stderr io.Writer) *Worker {
+// before constructing it); tests construct explicit configs. acq must not be
+// nil: a worker always goes through the gate, even when nothing is configured.
+func New(st *store.Store, exec executor.Runner, cfg Config, acq Acquirer, stderr io.Writer) *Worker {
 	return &Worker{
 		st:        st,
 		exec:      exec,
 		cfg:       cfg,
+		acq:       acq,
 		stderr:    stderr,
 		running:   make(map[string]context.CancelFunc),
 		cancelled: make(map[string]struct{}),
@@ -92,6 +108,32 @@ func (w *Worker) Handle(ctx context.Context, rec store.Record) {
 		w.save(rec)
 		return
 	}
+
+	/*
+		The claim is taken once per job, not once per attempt: three tries at
+		one gpu job are one claim on the gpu. It is acquired under execCtx,
+		the same context the attempts use, so a DELETE interrupts a job that
+		is still waiting, and a job that waits past its deadline times out
+		rather than starting late.
+	*/
+	gate, err := w.acq.Acquire(execCtx, rec.Resources)
+	if err != nil {
+		/*
+			A finished execCtx is the authoritative reason the wait ended —
+			cancelled, or the deadline passed — and that is not a failed
+			attempt. Any other error (a resource this process does not
+			configure) cannot be fixed by retrying, so it is terminal.
+		*/
+		if cerr := execCtx.Err(); cerr != nil {
+			w.finishCancelled(rec, cerr)
+			return
+		}
+		rec.Status = job.StatusFailed
+		rec.Err = err.Error()
+		w.save(rec)
+		return
+	}
+	defer gate() // released after the final save, before the claim is released
 
 	for attempt := rec.Attempts + 1; attempt <= w.cfg.MaxAttempts; attempt++ {
 		rec.Attempts = attempt

@@ -29,7 +29,23 @@ func (f runnerFunc) Run(ctx context.Context, j job.Job) (executor.Result, error)
 func newWorker(t *testing.T, r executor.Runner, cfg worker.Config) (*worker.Worker, *store.Store) {
 	t.Helper()
 	st := store.New(t.TempDir())
-	return worker.New(st, r, cfg, io.Discard), st
+	return worker.New(st, r, cfg, noAcquire{}, io.Discard), st
+}
+
+/*
+noAcquire is the acquirer for tests that do not care about capacity. The gate
+still runs on every job; it simply never waits, which is exactly what a pool
+with no configured resources does.
+*/
+type noAcquire struct{}
+
+func (noAcquire) Acquire(context.Context, []string) (func(), error) { return func() {}, nil }
+
+// newWorkerWith is newWorker with a specific acquirer.
+func newWorkerWith(t *testing.T, r executor.Runner, cfg worker.Config, acq worker.Acquirer) (*worker.Worker, *store.Store) {
+	t.Helper()
+	st := store.New(t.TempDir())
+	return worker.New(st, r, cfg, acq, io.Discard), st
 }
 
 func mustGet(t *testing.T, st *store.Store, id string) store.Record {
@@ -169,7 +185,7 @@ func TestHandleSaveFailureGoesToStderr(t *testing.T) {
 		return executor.Result{}, nil
 	})
 	var stderr bytes.Buffer
-	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second}, &stderr)
+	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second}, noAcquire{}, &stderr)
 
 	w.Handle(context.Background(), store.Record{ID: "j5", Command: []string{"true"}, Status: job.StatusPending})
 
@@ -194,7 +210,7 @@ func TestHandleConcurrentSaveFailuresRaceFree(t *testing.T) {
 	st := store.New(filepath.Join(blocker, "data"))
 	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) { return executor.Result{}, nil })
 	var stderr bytes.Buffer
-	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second}, &stderr)
+	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second}, noAcquire{}, &stderr)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -598,7 +614,7 @@ func TestHandleSurvivesHeartbeatWriteFailure(t *testing.T) {
 		return executor.Result{}, nil
 	})
 	var stderr bytes.Buffer
-	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second, Heartbeat: time.Millisecond}, &stderr)
+	w := worker.New(st, r, worker.Config{MaxAttempts: 1, Timeout: time.Second, Heartbeat: time.Millisecond}, noAcquire{}, &stderr)
 
 	w.Handle(context.Background(), store.Record{ID: "j-hbfail", Command: []string{"true"}, Status: job.StatusPending})
 
@@ -625,5 +641,234 @@ func TestHeartbeatRacesFinalSave(t *testing.T) {
 		if rec.Status != job.StatusSucceeded {
 			t.Fatalf("%s status = %v, want succeeded", id, rec.Status)
 		}
+	}
+}
+
+/*
+stubAcquirer stands in for *resource.Pool. It records calls and can block in
+Acquire until either its context ends — the honest way to test "cancelled
+while waiting" without sleeping — or release is closed.
+*/
+type stubAcquirer struct {
+	mu      sync.Mutex
+	calls   int
+	held    bool
+	err     error
+	blockOn string
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *stubAcquirer) Acquire(ctx context.Context, names []string) (func(), error) {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+
+	if a.err != nil {
+		return nil, a.err
+	}
+	if a.blockOn != "" && len(names) > 0 && names[0] == a.blockOn {
+		if a.entered != nil {
+			a.entered <- struct{}{}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-a.release:
+		}
+	}
+
+	a.mu.Lock()
+	a.held = true
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		a.held = false
+		a.mu.Unlock()
+	}, nil
+}
+
+func (a *stubAcquirer) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+func (a *stubAcquirer) isHeld() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.held
+}
+
+/*
+TestHandleHoldsResourcesWhileRunning pins the ordering: the claim is taken
+before the attempt starts and released only after it ends. A job that releases
+early would let the next holder start while the first is still running.
+*/
+func TestHandleHoldsResourcesWhileRunning(t *testing.T) {
+	acq := &stubAcquirer{}
+	var heldDuringRun bool
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		acq.mu.Lock()
+		heldDuringRun = acq.held
+		acq.mu.Unlock()
+		return executor.Result{}, nil
+	})
+	w, _ := newWorkerWith(t, r, worker.Config{MaxAttempts: 1, Timeout: time.Second}, acq)
+
+	w.Handle(context.Background(), store.Record{
+		ID: "j1", Command: []string{"true"}, Status: job.StatusPending, Resources: []string{"gpu"},
+	})
+
+	if !heldDuringRun {
+		t.Error("executor ran without the claim held")
+	}
+	if acq.isHeld() {
+		t.Error("claim still held after Handle returned")
+	}
+}
+
+/*
+TestHandleAcquiresOnceAcrossRetries pins "three attempts are one job": the
+claim is taken once, not once per attempt, or a retried gpu job would deadlock
+against itself.
+*/
+func TestHandleAcquiresOnceAcrossRetries(t *testing.T) {
+	acq := &stubAcquirer{}
+	calls := 0
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		calls++
+		if calls < 3 {
+			return executor.Result{ExitCode: 1}, errors.New("boom")
+		}
+		return executor.Result{}, nil
+	})
+	w, st := newWorkerWith(t, r, worker.Config{
+		MaxAttempts: 3, Backoff: time.Millisecond, Timeout: time.Second,
+	}, acq)
+
+	w.Handle(context.Background(), store.Record{
+		ID: "j1", Command: []string{"true"}, Status: job.StatusPending, Resources: []string{"gpu"},
+	})
+
+	if got := acq.count(); got != 1 {
+		t.Errorf("Acquire called %d times, want 1 across all attempts", got)
+	}
+	if rec := mustGet(t, st, "j1"); rec.Status != job.StatusSucceeded {
+		t.Errorf("status = %v, want succeeded", rec.Status)
+	}
+}
+
+/*
+TestHandleCancelledWhileWaiting pins the interaction that only exists once the
+gate is inside Handle: a DELETE while the job waits for capacity must end the
+record cancelled without consuming an attempt.
+*/
+func TestHandleCancelledWhileWaiting(t *testing.T) {
+	acq := &stubAcquirer{
+		blockOn: "gpu",
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	ran := false
+	r := runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		ran = true
+		return executor.Result{}, nil
+	})
+	w, st := newWorkerWith(t, r, worker.Config{MaxAttempts: 2, Timeout: 5 * time.Second}, acq)
+	if _, _, err := st.Create(store.Record{
+		ID: "j1", Command: []string{"true"}, Status: job.StatusPending, Resources: []string{"gpu"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Handle(context.Background(), mustGet(t, st, "j1"))
+	}()
+
+	select {
+	case <-acq.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handle never reached the acquire")
+	}
+	w.Cancel("j1")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handle did not return after Cancel")
+	}
+	rec := mustGet(t, st, "j1")
+	if rec.Status != job.StatusCancelled {
+		t.Errorf("status = %v, want cancelled", rec.Status)
+	}
+	if rec.Attempts != 0 {
+		t.Errorf("Attempts = %d, want 0 — waiting is not an attempt", rec.Attempts)
+	}
+	if ran {
+		t.Error("executor ran for a job cancelled while waiting")
+	}
+}
+
+/*
+TestHandleExhaustedNeverAcquires pins the budget check's position: a record
+that cannot run must not take capacity other jobs could use.
+*/
+func TestHandleExhaustedNeverAcquires(t *testing.T) {
+	acq := &stubAcquirer{}
+	w, st := newWorkerWith(t, runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		t.Error("executor ran an exhausted record")
+		return executor.Result{}, nil
+	}), worker.Config{MaxAttempts: 1, Timeout: time.Second}, acq)
+	if _, _, err := st.Create(store.Record{
+		ID: "j1", Command: []string{"true"}, Status: job.StatusPending,
+		Attempts: 1, Resources: []string{"gpu"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Handle(context.Background(), mustGet(t, st, "j1"))
+
+	if got := acq.count(); got != 0 {
+		t.Errorf("Acquire called %d times, want 0 for an exhausted record", got)
+	}
+	if rec := mustGet(t, st, "j1"); rec.Status != job.StatusFailed {
+		t.Errorf("status = %v, want failed", rec.Status)
+	}
+}
+
+/*
+TestHandleUnknownResourceFails pins "terminal, not retried": an error from the
+gate that is not cancellation cannot be fixed by trying again, so it fails on
+the first attempt without running the executor.
+*/
+func TestHandleUnknownResourceFails(t *testing.T) {
+	acq := &stubAcquirer{err: errors.New(`resource: "tpu" is not configured`)}
+	w, st := newWorkerWith(t, runnerFunc(func(context.Context, job.Job) (executor.Result, error) {
+		t.Error("executor ran a job whose capacity cannot be acquired")
+		return executor.Result{}, nil
+	}), worker.Config{MaxAttempts: 3, Backoff: time.Millisecond, Timeout: time.Second}, acq)
+	if _, _, err := st.Create(store.Record{
+		ID: "j1", Command: []string{"true"}, Status: job.StatusPending, Resources: []string{"tpu"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Handle(context.Background(), mustGet(t, st, "j1"))
+
+	rec := mustGet(t, st, "j1")
+	if rec.Status != job.StatusFailed {
+		t.Errorf("status = %v, want failed", rec.Status)
+	}
+	if rec.Attempts != 0 {
+		t.Errorf("Attempts = %d, want 0", rec.Attempts)
+	}
+	if !strings.Contains(rec.Err, "tpu") {
+		t.Errorf("Err = %q, want it to name the resource", rec.Err)
+	}
+	if got := acq.count(); got != 1 {
+		t.Errorf("Acquire called %d times, want exactly 1", got)
 	}
 }
