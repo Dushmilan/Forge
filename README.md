@@ -5,7 +5,9 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V6 are done. V7–V11 are planned.
+**Status:** V0–V6 are done, tagged `v0`–`v6`. Next up is V7 —
+priority/resource scheduling (`container/heap`, semaphores, interfaces);
+its spec is not written yet.
 
 ## Quick start
 

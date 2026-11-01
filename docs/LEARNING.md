@@ -152,9 +152,21 @@ Template:
   `store.List`; a heartbeat ticker joined before every outcome save; attempt
   resumption in `worker.Handle`; the `internal/recovery` startup pass; and
   `-heartbeat-interval` on `forge serve`.
-- **What surprised me:** _(you)_
-- **Idiom worth remembering:** _(you)_
-- **Next time:** _(you)_
+- **What surprised me:** That stopping a `Ticker` is not the same as being
+  done with it. `Stop()` prevents future ticks but leaves the heartbeat
+  goroutine racing the final save; only joining it makes "last write wins"
+  actually true. Equally: recovery needed an edge the normal state machine
+  forbids (`running → pending`), so the store — not the worker — has to own
+  that exception.
+- **Idiom worth remembering:** The stop-signal join — `ticker.Stop()`,
+  close a `done` channel, `<-done`, *then* save — as the only way to end a
+  background writer deterministically. And `*time.Time` for a timestamp that
+  may not exist: nil omits the field, while `time.Time` would stamp year 1
+  onto every pending job.
+- **Next time:** Write down who owns each field before adding a second
+  writer. That `Save` preserves `LastHeartbeat` was a correction; had I
+  decided "ticker owns liveness, worker owns status" first, the rule would
+  have been in `Save` from the start.
 
 ## V6 — Idempotency
 
@@ -186,6 +198,17 @@ Template:
   `POST /jobs` (202 new / 200 replay / 409 mismatch / 400 oversize), and
   end-to-end replay tests that count the command's side effect rather than
   trusting its status.
-- **What surprised me:** _(you)_
-- **Idiom worth remembering:** _(you)_
-- **Next time:** _(you)_
+- **What surprised me:** How much of the version was deciding *where* the
+  guarantee lives, not writing it. Dedupe is a dozen lines inside a lock I
+  already had; the real work was ordering validation before `Create`,
+  stopping `Save` from erasing a key, and accepting that a replay must not
+  re-enqueue even when that leaves a job stalled until restart.
+- **Idiom worth remembering:** Derive an index inside the critical section
+  instead of persisting it. `map[string]string` built from the loaded
+  records under `s.mu` is O(n), but it cannot disagree with the file and
+  needs no migration. A stored index is just another piece of state that can
+  be wrong.
+- **Next time:** Nail the external contract — status codes and who owns each
+  decision — before the store method. Once the 202/200/409 table existed, it
+  was obvious command comparison belonged in `api`; before it, I wanted to
+  push it into `store`.
