@@ -55,6 +55,14 @@ type Record struct {
 		written before V6 byte-identical, so old stores load unchanged.
 	*/
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	/*
+		Priority and Resources are admission-time intent, like the key: the
+		client decides them once and the worker only carries them around.
+		Both are omitempty so a normal, resource-free record serializes
+		exactly as it did in V6 — old files stay byte-identical.
+	*/
+	Priority  job.Priority `json:"priority,omitempty"`
+	Resources []string     `json:"resources,omitempty"`
 }
 
 // Store reads and writes <dir>/jobs.json. The zero construction is New;
@@ -222,12 +230,15 @@ func (s *Store) insertLocked(m map[string]Record, r Record) error {
 		}
 		/*
 			Field ownership: Save carries whole records from the worker and
-			recovery, so it must never write the two fields it does not own.
-			A stale snapshot that predates the heartbeat or the key would
-			otherwise erase liveness or identity.
+			recovery, so it must never write the fields it does not own. A
+			stale snapshot that predates the heartbeat or the key would
+			otherwise erase liveness or identity, and one that predates
+			admission would silently demote a high-priority job to normal.
 		*/
 		r.LastHeartbeat = cur.LastHeartbeat
 		r.IdempotencyKey = cur.IdempotencyKey
+		r.Priority = cur.Priority
+		r.Resources = cur.Resources
 	}
 	m[r.ID] = r
 	return s.writeLocked(m)

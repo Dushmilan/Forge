@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -598,5 +599,106 @@ func TestSaveCannotCreateKeyedRecord(t *testing.T) {
 	}
 	if _, gerr := s.Get("b"); !errors.Is(gerr, store.ErrNotFound) {
 		t.Errorf("Get(b) = %v, want ErrNotFound — the refused save wrote nothing", gerr)
+	}
+}
+
+/*
+TestRecordSchedulingFieldsRoundTrip pins durability: a claim survives the file,
+because recovery has to requeue an interrupted gpu job with its claim intact.
+*/
+func TestRecordSchedulingFieldsRoundTrip(t *testing.T) {
+	s := store.New(t.TempDir())
+	if _, _, err := s.Create(store.Record{
+		ID: "train", Command: []string{"true"}, Status: job.StatusPending,
+		Priority: job.PriorityHigh, Resources: []string{"gpu"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get("train")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != job.PriorityHigh || !slices.Equal(got.Resources, []string{"gpu"}) {
+		t.Errorf("record = priority %v resources %v, want high [gpu]", got.Priority, got.Resources)
+	}
+}
+
+/*
+TestNormalRecordOmitsSchedulingFields pins that a plain job still looks exactly
+like a V6 job on disk, so every existing store stays byte-identical after the
+next save instead of gaining churn.
+*/
+func TestNormalRecordOmitsSchedulingFields(t *testing.T) {
+	dir := t.TempDir()
+	s := store.New(dir)
+	if _, _, err := s.Create(store.Record{
+		ID: "plain", Command: []string{"true"}, Status: job.StatusPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("priority")) || bytes.Contains(b, []byte("resources")) {
+		t.Errorf("jobs.json = %s, want no priority/resources keys for a normal job", b)
+	}
+}
+
+/*
+TestOldFileLoadsAsNormal pins compatibility in the other direction: a file
+written before V7 has no scheduling fields and must load unchanged.
+*/
+func TestOldFileLoadsAsNormal(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"old": {"id": "old", "command": ["true"], "status": "pending"}}`
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.New(dir).Get("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != job.PriorityNormal || len(got.Resources) != 0 {
+		t.Errorf("old record = %v %v, want normal and no resources", got.Priority, got.Resources)
+	}
+}
+
+/*
+TestSavePreservesSchedulingFields pins field ownership: the worker saves whole
+records from a snapshot, and a stale one must not downgrade a high-priority gpu
+job to a plain normal one.
+*/
+func TestSavePreservesSchedulingFields(t *testing.T) {
+	s := store.New(t.TempDir())
+	if _, _, err := s.Create(store.Record{
+		ID: "train", Command: []string{"true"}, Status: job.StatusPending,
+		Priority: job.PriorityCritical, Resources: []string{"gpu"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(store.Record{
+		ID: "train", Command: []string{"true"}, Status: job.StatusRunning, Attempts: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get("train")
+	if got.Priority != job.PriorityCritical || !slices.Equal(got.Resources, []string{"gpu"}) {
+		t.Errorf("after save = %v %v, want critical [gpu]", got.Priority, got.Resources)
+	}
+}
+
+/*
+TestUnknownPriorityInFileFails pins the loud-corruption rule: a hand-edited
+"urgent" must not silently run at normal priority.
+*/
+func TestUnknownPriorityInFileFails(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"a": {"id": "a", "command": ["true"], "status": "pending", "priority": "urgent"}}`
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.New(dir).Get("a"); err == nil {
+		t.Fatal("Get(corrupt priority) = nil error, want a decode error")
 	}
 }
