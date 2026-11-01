@@ -212,3 +212,36 @@ Template:
   decision — before the store method. Once the 202/200/409 table existed, it
   was obvious command comparison belonged in `api`; before it, I wanted to
   push it into `store`.
+
+## V7 — Priority and resource scheduling
+
+- **Concept:** `container/heap` is compensation for a data structure Go does
+  not ship: you implement `heap.Interface`, and `Less` is where the policy
+  lives. It is a **min**-heap, so "highest priority comes out first" means
+  comparing with `>`. A heap is not stable, so FIFO inside one priority needs
+  a sequence number the record does not otherwise carry. A buffered channel is
+  a counting semaphore — taking a token is a send, releasing is a receive —
+  and a channel of capacity 1 makes a coalescing wakeup signal. Acquiring
+  several resources in one global order is what prevents circular wait.
+- **What I built:** `job.Priority` and `ValidateResources`; `Record.Priority`
+  and `Record.Resources` with `omitempty` so V1–V6 files still load;
+  `pendingHeap` and the heap-backed `Queue` whose `slots` channel keeps V2's
+  backpressure and whose `notify` channel replaced the job channel as the
+  worker's wakeup; `internal/resource` with `Pool.Acquire` releasing every
+  partially held token on cancellation; the `worker.Acquirer` gate; and the
+  API admission table plus `-resources gpu=2,db=4`.
+- **What surprised me:** That the job channel had to go, not be extended. I
+  expected to add a priority check around `Enqueue` and keep the channel, but
+  a channel has no way to say "not this one yet" — receiving *is* the choice.
+  Once the heap held the pending records, the channel came back as the
+  wakeup, where "one bit, duplicates are fine" is exactly what it is good at.
+- **Idiom worth remembering:** A wakeup channel is not a work channel. Sending
+  non-blockingly on a capacity-1 channel turns N "something arrived" events
+  into one "go look" without ever blocking the producer, and popping may
+  re-signal if the pop left records behind. Compare that with `sync.Cond`,
+  which cannot be `select`ed against `ctx.Done()`.
+- **Next time:** Write the deadlock argument before the acquisition code. The
+  sorted-name rule and "release everything you already hold" were one sentence
+  in the spec and the part I re-derived most slowly; the mutation test (make
+  `Acquire` a no-op, watch two `gpu` jobs interleave) proved the guard faster
+  than rereading it.

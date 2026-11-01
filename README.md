@@ -5,9 +5,9 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V6 are done, tagged `v0`–`v6`. Next up is V7 —
-priority/resource scheduling (`container/heap`, semaphores, interfaces);
-its spec is not written yet.
+**Status:** V0–V7 are done, tagged `v0`–`v7`. Next up is V8 —
+sandboxed execution (`os/exec`, processes, signals, filesystem); its spec is
+not written yet.
 
 ## Quick start
 
@@ -28,7 +28,7 @@ any other Unix tool. Called with no arguments it prints usage and exits 2.
 go build ./cmd/forge
 ./forge serve -addr :8080 -data ./data -workers 4 \
   -max-attempts 3 -retry-backoff 100ms -job-timeout 30s \
-  -heartbeat-interval 1s
+  -heartbeat-interval 1s -resources gpu=2,db=4
 ```
 
 ```sh
@@ -38,6 +38,8 @@ curl -X POST localhost:8080/jobs \
   -d '{"command": ["echo", "hello"]}'       # 202; retry the same key -> 200, same id
 curl localhost:8080/jobs/<id>                                          # 200 + record (poll for final status)
 curl -X DELETE localhost:8080/jobs/<id>                                # 202: cancel queued or running
+curl -X POST localhost:8080/jobs \
+  -d '{"command": ["train"], "priority": "high", "resources": ["gpu"]}'  # 202; refused 400 if not runnable here
 ```
 
 Jobs run asynchronously (V2): the POST returns 202 with a `pending` record
@@ -55,7 +57,11 @@ crash-looping. Recovery is at-least-once — a job interrupted after its side
 effect can run again. As of V6 a submission may carry an `Idempotency-Key`:
 a retry with the same key returns the original job (200) instead of creating a
 second one, so creation is at-most-once per key while execution stays
-at-least-once.
+at-least-once. As of V7 a submission may name a `priority` (`low`, `normal`,
+`high`, `critical`) and the `resources` it needs; the queue serves the highest
+priority first, and a job holds every resource it named for as long as it runs.
+The server refuses a claim it cannot run — an unconfigured resource is a 400,
+not a job that waits forever.
 Every submitted job is persisted to `<data>/jobs.json`.
 
 Run the tests:
@@ -236,6 +242,53 @@ The guarantee is split by boundary, and V6 only claims the first one:
 | **Creation** (V6) | at-most-once per key: one key, one record, one enqueue |
 | **Execution** (V5) | at-least-once: an interrupted attempt runs again |
 
+## How it works (V7)
+
+V6's FIFO channel cannot reorder, so V7 replaces the container and keeps the
+channel only as a signal:
+
+```
+POST /jobs {"priority":"high","resources":["gpu"]}
+      │
+      ├── unknown / duplicate / >8 resource, unknown priority ──▶ 400, stores nothing
+      │
+   Enqueue ──▶ slots (64 tokens) ──▶ pendingHeap
+                                        │ Less: priority ↓, then seq ↑
+                    worker ──▶ pop best ◀┘
+                       │
+                resource.Acquire(ctx, names)   one token per name, sorted
+                       │                       (same order everywhere: no circular wait)
+                       ▼
+                 attempt loop — retries reuse the same token
+```
+
+- [`internal/queue`](internal/queue) — `pendingHeap` implements
+  `container/heap.Interface`. `Less` is the policy, and `container/heap` is a
+  **min**-heap, so a higher priority compares with `>`. The heap is not stable,
+  so each record carries a sequence number assigned at `Enqueue`: without it,
+  FIFO within a priority would only be accidentally true. `notify` (capacity 1)
+  is a wakeup, not a job: it merges duplicate signals, and a pop re-signals if
+  it left work behind. `slots` is the V2 backpressure contract kept intact — a
+  full queue still blocks the sender — and pops a token back.
+- [`internal/resource`](internal/resource) — one buffered channel per named
+  resource: a Go channel used as a counting semaphore. Names are acquired in
+  sorted order, so two workers claiming `[db, gpu]` and `[gpu, db]` cannot
+  deadlock, and a cancellation releases every unit already held.
+- [`internal/worker`](internal/worker) — `Acquirer` is the consumer-defined
+  interface (the worker asks for capacity; it does not know a pool exists).
+  Acquisition happens before the retry loop, so a retrying job keeps its units
+  and never loses them to another job mid-run.
+- [`internal/api`](internal/api) — admission refuses what the server cannot
+  run, *before* a record exists. A replayed `Idempotency-Key` compares the whole
+  intent (command, priority, resources), not just the command.
+- [`cmd/forge`](cmd/forge) — `-resources gpu=2,db=4`; a malformed spec is a
+  startup error, because a typo'd capacity must never silently mean "no limit".
+
+Known limit: a job waiting for capacity holds a worker, so one oversubscribed
+resource can stall unrelated jobs behind it. There is no preemption and no
+aging, so a stream of `critical` jobs can starve `low` ones. Capacity is
+per-process, which V11 has to change.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
@@ -247,7 +300,7 @@ The guarantee is split by boundary, and V6 only claims the first one:
 | V4  | Retries + cancellation         | `context`, timers, backoff, `defer`              | ✅     |
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ✅     |
 | V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ✅     |
-| V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ⏳     |
+| V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ✅     |
 | V8  | Sandboxed execution            | `os/exec`, processes, signals, filesystem        | ⏳     |
 | V9  | Observability                  | `slog`, `expvar`, `pprof`, metrics               | ⏳     |
 | V10 | Load testing + profiling       | `testing.B`, pprof, escape analysis              | ⏳     |
@@ -270,6 +323,7 @@ Forge/
 │   ├── queue/             # channel + worker loop (V2)
 │   ├── worker/            # retries, backoff, timeouts, cancellation (V4)
 │   ├── recovery/          # startup reconciliation of orphaned records (V5)
+│   ├── resource/          # named capacity as counting semaphores (V7)
 │   └── api/               # HTTP handlers (V1, async since V2)
 └── docs/
     ├── LEARNING.md        # one entry per version: what Go concept clicked
