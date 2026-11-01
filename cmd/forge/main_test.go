@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -941,5 +944,143 @@ func TestRunServeInvalidResourcesExits2(t *testing.T) {
 	}
 	if stderr.Len() == 0 {
 		t.Error("stderr is empty, want an explanation of the bad capacity")
+	}
+}
+
+/*
+TestRunServePriorityBeatsArrival pins the headline end to end. A blocker job
+holds the only worker while two more are submitted; when the blocker is
+released, priority decides the rest. The gate file, not a sleep, is what makes
+the ordering deterministic.
+*/
+func TestRunServePriorityBeatsArrival(t *testing.T) {
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "gate")
+	log := filepath.Join(dir, "order")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddrData(t, ctx, t.TempDir(), "-workers", "1", "-job-timeout", "10s")
+
+	blocker := fmt.Sprintf(`{"command":["sh","-c","while [ ! -f %s ]; do sleep 0.01; done; echo blocker >> %s"]}`, gate, log)
+	low := fmt.Sprintf(`{"command":["sh","-c","echo low >> %s"]}`, log)
+	high := fmt.Sprintf(`{"command":["sh","-c","echo high >> %s"]}`, log)
+
+	// Fill the worker first so both others are still pending when priority matters.
+	blockerRec := postJob(t, addr, blocker)
+	waitStatus(t, addr, blockerRec.ID, job.StatusRunning)
+	postPriority(t, addr, low, "low")
+	postPriority(t, addr, high, "high")
+
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, addr, blockerRec.ID, job.StatusSucceeded)
+	waitFor(t, func() bool { return countLines(t, log) == 3 })
+	if got := readLines(t, log); !slices.Equal(got, []string{"blocker", "high", "low"}) {
+		t.Errorf("run order = %v, want blocker, high, low", got)
+	}
+	cancel()
+	<-code
+}
+
+/*
+TestRunServeResourceCapacitySerializes pins the semaphore end to end: two gpu
+jobs with capacity 1 must not interleave their start/end markers.
+*/
+func TestRunServeResourceCapacitySerializes(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	body := fmt.Sprintf(`{"command":["sh","-c","echo start >> %s; sleep 0.1; echo end >> %s"],"resources":["gpu"]}`, log, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddrData(t, ctx, t.TempDir(), "-workers", "2", "-resources", "gpu=1", "-job-timeout", "10s")
+
+	a := postJob(t, addr, body)
+	b := postJob(t, addr, body)
+	waitStatus(t, addr, a.ID, job.StatusSucceeded)
+	waitStatus(t, addr, b.ID, job.StatusSucceeded)
+
+	if got := readLines(t, log); !slices.Equal(got, []string{"start", "end", "start", "end"}) {
+		t.Errorf("log = %v, want start,end,start,end (no overlap)", got)
+	}
+	cancel()
+	<-code
+}
+
+/*
+TestRunServeRejectsUnknownResource pins the admission table at the process
+boundary: no capacity configured, so the claim never becomes a job.
+*/
+func TestRunServeRejectsUnknownResource(t *testing.T) {
+	data := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, code := serveAddrData(t, ctx, data)
+
+	body := `{"command":["true"],"resources":["gpu"]}`
+	resp, err := http.Post("http://"+addr+"/jobs", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST status = %d, want 400", resp.StatusCode)
+	}
+
+	cancel()
+	<-code
+	all, err := store.New(data).List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 0 {
+		t.Errorf("stored %d records, want 0: %+v", len(all), all)
+	}
+}
+
+// postPriority submits body with a priority field spliced in, so a test can
+// keep the command JSON readable and still exercise the scheduling header.
+func postPriority(t *testing.T, addr, body, priority string) store.Record {
+	t.Helper()
+	full := strings.TrimSuffix(body, "}") + `,"priority":"` + priority + `"}`
+	return postJob(t, addr, full)
+}
+
+// readLines returns the non-empty lines of path, or nil while it does not exist
+// yet — the log is written by the jobs, so its absence is a legitimate state.
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	return len(readLines(t, path))
+}
+
+// waitFor polls cond until it holds. The deadline is the bound; the interval is
+// not the guarantee.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never became true")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
