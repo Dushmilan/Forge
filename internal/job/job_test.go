@@ -177,3 +177,96 @@ func TestStatusCanTransition(t *testing.T) {
 		})
 	}
 }
+
+/*
+TestPriorityNormalIsZero pins the compatibility rule the whole version rests
+on: the zero value must mean "normal", so an absent field and a V6 file both
+decode without a special case.
+*/
+func TestPriorityNormalIsZero(t *testing.T) {
+	var p job.Priority
+	if p != job.PriorityNormal {
+		t.Errorf("zero Priority = %q, want normal", p)
+	}
+}
+
+/*
+TestPriorityOrdering pins the direction container/heap will depend on: the
+numeric order is low < normal < high < critical. Less compares these values.
+*/
+func TestPriorityOrdering(t *testing.T) {
+	if !(job.PriorityLow < job.PriorityNormal &&
+		job.PriorityNormal < job.PriorityHigh &&
+		job.PriorityHigh < job.PriorityCritical) {
+		t.Errorf("priority values are not ordered low < normal < high < critical")
+	}
+}
+
+/*
+TestPriorityJSONRoundTrip pins the wire form: readable names, and an unknown
+name is an error rather than a silent "normal".
+*/
+func TestPriorityJSONRoundTrip(t *testing.T) {
+	for _, tt := range []struct {
+		p    job.Priority
+		name string
+	}{
+		{job.PriorityLow, `"low"`},
+		{job.PriorityNormal, `"normal"`},
+		{job.PriorityHigh, `"high"`},
+		{job.PriorityCritical, `"critical"`},
+	} {
+		b, err := json.Marshal(tt.p)
+		if err != nil {
+			t.Fatalf("Marshal(%v): %v", tt.p, err)
+		}
+		if string(b) != tt.name {
+			t.Errorf("Marshal(%v) = %s, want %s", tt.p, b, tt.name)
+		}
+		var got job.Priority
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", b, err)
+		}
+		if got != tt.p {
+			t.Errorf("round trip %s = %v, want %v", b, got, tt.p)
+		}
+	}
+}
+
+func TestPriorityUnknownNameFails(t *testing.T) {
+	var p job.Priority
+	if err := json.Unmarshal([]byte(`"urgent"`), &p); err == nil {
+		t.Fatal("Unmarshal(urgent) = nil, want an error")
+	}
+}
+
+/*
+TestValidateResources pins the claim's shape — not its availability, which
+belongs to the pool. Duplicates matter: ["gpu","gpu"] with capacity 1 would
+wait for itself forever.
+*/
+func TestValidateResources(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		names   []string
+		wantErr bool
+	}{
+		{"none", nil, false},
+		{"one", []string{"gpu"}, false},
+		{"two", []string{"gpu", "db"}, false},
+		{"empty name", []string{""}, true},
+		{"empty among good", []string{"gpu", ""}, true},
+		{"duplicate", []string{"gpu", "gpu"}, true},
+		{"too many", []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := job.ValidateResources(tt.names)
+			if tt.wantErr && !errors.Is(err, job.ErrInvalidJob) {
+				t.Errorf("ValidateResources(%v) = %v, want an ErrInvalidJob", tt.names, err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("ValidateResources(%v) = %v, want nil", tt.names, err)
+			}
+		})
+	}
+}

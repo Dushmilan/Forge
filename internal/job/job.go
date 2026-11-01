@@ -100,6 +100,105 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 var _ fmt.Stringer = Status(0)
 
 /*
+Priority orders pending records. Like Status it is a named type over int, so
+the compiler refuses to let a priority be confused with any other number —
+a count, an index, an attempt.
+*/
+type Priority int
+
+/*
+iota - 1 is the whole point of this block. PriorityNormal must sit at zero:
+a store file written before V7 has no priority field, and a client that never
+mentions priority sends none, so BOTH mean "normal" with no special case
+anywhere. The other levels fall out around it, and the numeric order
+(low < normal < high < critical) is exactly what the queue's Less relies on.
+*/
+const (
+	PriorityLow      Priority = iota - 1 // -1
+	PriorityNormal                       //  0
+	PriorityHigh                         //  1
+	PriorityCritical                     //  2
+)
+
+// String makes Priority satisfy fmt.Stringer, exactly as Status does.
+func (p Priority) String() string {
+	switch p {
+	case PriorityLow:
+		return "low"
+	case PriorityNormal:
+		return "normal"
+	case PriorityHigh:
+		return "high"
+	case PriorityCritical:
+		return "critical"
+	default:
+		// int(p) keeps fmt from re-entering String() through its Stringer
+		// path, which would recurse forever.
+		return fmt.Sprintf("Priority(%d)", int(p))
+	}
+}
+
+// MarshalJSON writes the name rather than the number, so the store file and
+// the API stay readable and a renumbering cannot silently reorder jobs.
+func (p Priority) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.String())
+}
+
+// UnmarshalJSON accepts a known name. An unknown one is an error, not
+// "normal": a typo in a stored file must fail loudly instead of quietly
+// reordering the queue.
+func (p *Priority) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("job: priority must be a string: %w", err)
+	}
+	switch name {
+	case "low":
+		*p = PriorityLow
+	case "normal":
+		*p = PriorityNormal
+	case "high":
+		*p = PriorityHigh
+	case "critical":
+		*p = PriorityCritical
+	default:
+		return fmt.Errorf("job: unknown priority %q", name)
+	}
+	return nil
+}
+
+// Compile-time proof that Priority implements fmt.Stringer.
+var _ fmt.Stringer = Priority(0)
+
+// MaxResourcesPerJob bounds one claim. The store's file is the whole database,
+// so one job may not ask for an unbounded list of names.
+const MaxResourcesPerJob = 8
+
+/*
+ValidateResources checks the SHAPE of a resource claim: non-empty names, no
+duplicates, a bounded count. Availability is not job's business — the resource
+pool answers that and the API asks it. Duplicates are rejected because a job
+that asks for one unit twice would wait for itself forever.
+*/
+func ValidateResources(names []string) error {
+	if len(names) > MaxResourcesPerJob {
+		return fmt.Errorf("job: %d resources claimed, limit %d: %w",
+			len(names), MaxResourcesPerJob, ErrInvalidJob)
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			return fmt.Errorf("job: empty resource name: %w", ErrInvalidJob)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("job: resource %q claimed twice: %w", name, ErrInvalidJob)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+/*
 Terminal reports whether a status can still change. A DELETE may only act on
 a non-terminal job; this is the state machine's own answer, not a list of
 strings duplicated in the API.
