@@ -1,16 +1,23 @@
 /*
-Package queue moves job execution off the request path: Enqueue buffers a
-record on a channel, Run drains it across a pool of worker goroutines.
+Package queue holds records waiting to run and hands them to a pool of worker
+goroutines in priority order.
 
-The whole package is V2's idea plus V3's widening — the queue IS the
-channel, and the worker pool IS N goroutines running the same select loop
-over it. Rebuilding a queue from a slice + mutex + sync.Cond is the classic
-pre-Go mistake; a buffered chan is already a thread-safe FIFO, and it is
-already safe for concurrent receivers, so N workers need no extra lock.
+V2 built this on a channel, and for a strict FIFO that is exactly right. V7
+breaks the FIFO assumption: a channel cannot reorder what is already in it, so
+the buffer becomes a container/heap guarded by a mutex. The channel did not
+disappear — it moved. notify is a one-slot channel that wakes a sleeping
+worker, and slots is a buffered channel used as a counting semaphore so the
+"at most Capacity records pending" contract still holds without a second
+queue.
+
+sync.Cond is the other textbook answer and it is still wrong here: a Cond
+cannot be selected against ctx.Done(), so a worker blocked on it could not
+notice shutdown.
 */
 package queue
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"sync"
@@ -18,34 +25,53 @@ import (
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
-// Capacity is the queue's fixed buffer size. 64 is a decision, not a knob:
-// making it configurable is V7's scheduling story, and YAGNI says wait for
-// the need.
+// Capacity bounds how many records may be pending. 64 is still a decision,
+// not a knob: V2 predicted this would become configurable, but the V7 need
+// turned out to be ordering, not size.
 const Capacity = 64
 
-// Queue is an in-memory FIFO of records waiting to run. The channel is the
-// entire state — no slice, no mutex. The zero value is not usable; call New.
+/*
+Queue is an in-memory priority queue of records waiting to run.
+
+mu guards pending and seq; everything else is channel state. The zero value is
+not usable; call New.
+*/
 type Queue struct {
-	jobs chan store.Record
+	mu      sync.Mutex
+	pending pendingHeap
+	// seq stamps arrival order. A heap is not stable, so equal priorities
+	// need something that is.
+	seq uint64
+	// notify holds at most one token: "something is pending". It coalesces
+	// because a worker that wakes early will simply pop again; a token per
+	// record would let the buffer fill with stale wakeups.
+	notify chan struct{}
+	// slots is a semaphore with Capacity tokens, one held by each pending
+	// record. Enqueue takes one, pop returns one — that is the whole
+	// backpressure contract, unchanged from V2.
+	slots chan struct{}
 }
 
-// New returns an empty Queue with Capacity slots of buffer.
+// New returns an empty Queue with Capacity slots of pending room.
 func New() *Queue {
-	return &Queue{jobs: make(chan store.Record, Capacity)}
+	q := &Queue{
+		notify: make(chan struct{}, 1),
+		slots:  make(chan struct{}, Capacity),
+	}
+	for i := 0; i < Capacity; i++ {
+		q.slots <- struct{}{}
+	}
+	return q
 }
 
 /*
-Enqueue hands rec to the worker via select over two cases: the send, and
-ctx.Done(). While the worker lives, a full buffer makes the caller wait —
-backpressure. After cancellation the send case may never succeed (the
-receiver is gone), so the ctx case is what keeps a late POST from
-blocking http.Server.Shutdown forever. ctx.Err is wrapped so callers can
-still ask errors.Is(err, context.Canceled).
+Enqueue adds rec to the pending set. It blocks while Capacity records are
+already pending — backpressure — and returns early if ctx ends first.
 
-Cancellation gets an explicit priority check first: with both cases ready
-(cancelled ctx, free buffer) select chooses pseudo-randomly, and a
-shutdown-race POST must NOT be able to slip into the buffer half the time
-— the API's 503 contract depends on this being deterministic.
+Cancellation keeps V2's explicit priority check: with both cases ready
+(cancelled ctx, free slot) select picks pseudo-randomly, and the API's 503
+contract depends on a shutdown-race POST being refused every time, not half
+the time.
 */
 func (q *Queue) Enqueue(ctx context.Context, rec store.Record) error {
 	select {
@@ -54,11 +80,65 @@ func (q *Queue) Enqueue(ctx context.Context, rec store.Record) error {
 	default:
 	}
 	select {
-	case q.jobs <- rec:
-		return nil
+	case <-q.slots:
 	case <-ctx.Done():
 		return fmt.Errorf("queue: enqueue: %w", ctx.Err())
 	}
+
+	q.mu.Lock()
+	q.pushLocked(rec)
+	q.mu.Unlock()
+
+	/*
+		A non-blocking send: if the token is already there, some worker is
+		about to look at the heap anyway. Blocking here would let a slow
+		worker stall an HTTP handler for no reason.
+	*/
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// pushLocked stamps rec with the next sequence number and inserts it. The
+// caller holds q.mu; the suffix says so.
+func (q *Queue) pushLocked(rec store.Record) {
+	q.seq++
+	heap.Push(&q.pending, item{rec: rec, seq: q.seq})
+}
+
+/*
+pop removes the best record, or reports false when nothing is pending.
+
+Returning the slot here — rather than in Enqueue — is what keeps the counts
+honest: a record holds a token for exactly as long as it is pending, and the
+token comes back the moment it starts running.
+*/
+func (q *Queue) pop() (store.Record, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.pending) == 0 {
+		return store.Record{}, false
+	}
+	it := heap.Pop(&q.pending).(item)
+
+	// This record held one token, so the channel has room and the send
+	// cannot block while the mutex is held.
+	q.slots <- struct{}{}
+
+	/*
+		Wake a peer if work remains. Without this, one worker would drain the
+		whole heap while the others slept on the single notify token.
+	*/
+	if len(q.pending) > 0 {
+		select {
+		case q.notify <- struct{}{}:
+		default:
+		}
+	}
+	return it.rec, true
 }
 
 /*
@@ -70,8 +150,8 @@ spawning goroutine before `go`, never inside the child goroutine — otherwise
 wg.Wait() could race ahead of the child's Add and return before the worker
 even starts.
 
-Competing consumers need no extra lock: a Go channel already guarantees
-each record is received by exactly one worker.
+The mutex inside pop is what makes competing consumers safe now that the
+buffer is not a channel: each pop is one atomic "take the best item".
 */
 func (q *Queue) Run(ctx context.Context, workers int, handler func(context.Context, store.Record)) {
 	var wg sync.WaitGroup
@@ -86,30 +166,33 @@ func (q *Queue) Run(ctx context.Context, workers int, handler func(context.Conte
 }
 
 /*
-work is one worker goroutine's lifecycle: pull a record, run handler to
-completion, then re-select. Between jobs it notices ctx cancellation and
-returns; records still buffered stay pending.
+work is one worker goroutine's lifecycle: take the best pending record, run
+handler to completion, then take another. It blocks on notify only when the
+heap is empty, and the select there is what lets shutdown reach a worker that
+is waiting rather than working.
 */
 func (q *Queue) work(ctx context.Context, handler func(context.Context, store.Record)) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case rec := <-q.jobs:
-			/*
-				Both select cases can be ready at once (cancel raced a
-				delivery), and select chooses pseudo-randomly between ready
-				cases — so a cancelled worker must re-check before dispatching,
-				or a buffered record could still reach the handler after
-				shutdown. This inner non-blocking select is that priority
-				rule: cancellation always wins over delivery.
-			*/
+		rec, ok := q.pop()
+		if !ok {
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-q.notify:
+				continue
 			}
-			handler(ctx, rec)
 		}
+		/*
+			Cancellation can race the delivery — the worker may have already
+			popped when ctx ended — so it re-checks before dispatching, or a
+			record could start running after shutdown. This is V2's rule,
+			unchanged: cancellation always wins over delivery.
+		*/
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		handler(ctx, rec)
 	}
 }

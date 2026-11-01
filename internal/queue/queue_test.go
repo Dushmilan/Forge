@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
 	"github.com/Dushmilan/Forge/internal/store"
 )
@@ -466,4 +467,102 @@ func TestRunPassesLifecycleContext(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler never received the record")
 	}
+}
+
+/*
+TestRunServesHighestPriorityFirst pins the headline of V7. With one worker the
+delivery order IS the run order, so priority becomes observable without timing
+anything.
+*/
+func TestRunServesHighestPriorityFirst(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "low", Priority: job.PriorityLow})
+	mustEnqueue(t, ctx, q, store.Record{ID: "normal", Priority: job.PriorityNormal})
+	mustEnqueue(t, ctx, q, store.Record{ID: "high", Priority: job.PriorityHigh})
+
+	order := make(chan string, 3)
+	done := make(chan struct{})
+	go func() {
+		q.Run(ctx, 1, func(_ context.Context, r store.Record) { order <- r.ID })
+		close(done)
+	}()
+
+	for _, want := range []string{"high", "normal", "low"} {
+		select {
+		case got := <-order:
+			if got != want {
+				t.Fatalf("ran %q, want %q", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("never ran %q", want)
+		}
+	}
+	cancel()
+	<-done
+}
+
+/*
+TestRunIsFIFOWithinPriority pins the sequence tie-break. A heap is not stable,
+so without it equal priorities come out in whatever shape the heap happens to
+have — with twenty records, almost never arrival order.
+*/
+func TestRunIsFIFOWithinPriority(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		mustEnqueue(t, ctx, q, store.Record{ID: strconv.Itoa(i), Priority: job.PriorityNormal})
+	}
+
+	order := make(chan string, n)
+	go q.Run(ctx, 1, func(_ context.Context, r store.Record) { order <- r.ID })
+
+	for i := 0; i < n; i++ {
+		select {
+		case got := <-order:
+			if got != strconv.Itoa(i) {
+				t.Fatalf("ran %q at position %d, want %q", got, i, strconv.Itoa(i))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d records ran", i)
+		}
+	}
+}
+
+/*
+TestPushWakesEveryIdleWorker pins the wakeup contract: two records and two
+workers must put BOTH handlers in flight at once. A worker that drains the
+heap alone while its peer sleeps behind a notify token fails the gate below.
+*/
+func TestPushWakesEveryIdleWorker(t *testing.T) {
+	q := queue.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gate := make(chan struct{})
+	entered := make(chan string, 2)
+	go q.Run(ctx, 2, func(ctx context.Context, r store.Record) {
+		entered <- r.ID
+		select {
+		case <-gate:
+		case <-ctx.Done():
+		}
+	})
+
+	mustEnqueue(t, ctx, q, store.Record{ID: "a"})
+	mustEnqueue(t, ctx, q, store.Record{ID: "b"})
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d worker(s) entered a handler; the second was never woken", i)
+		}
+	}
+	close(gate)
 }
