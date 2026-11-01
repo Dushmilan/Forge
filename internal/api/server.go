@@ -35,6 +35,16 @@ type Server struct {
 	st  *store.Store
 	ctx context.Context
 	c   Canceller
+	res Resources
+}
+
+/*
+Resources is the read-only half of V7's admission check, declared here where
+it is consumed. The API only needs to know whether a claim is runnable at
+all; handing out capacity is the worker's job.
+*/
+type Resources interface {
+	Configured(name string) bool
 }
 
 /*
@@ -56,8 +66,8 @@ down). It is not a request's context: http.Server.Shutdown waits for
 active requests but never cancels them, so Enqueue needs both signals —
 see createJob.
 */
-func New(ctx context.Context, q *queue.Queue, st *store.Store, c Canceller) *Server {
-	return &Server{q: q, st: st, ctx: ctx, c: c}
+func New(ctx context.Context, q *queue.Queue, st *store.Store, c Canceller, res Resources) *Server {
+	return &Server{q: q, st: st, ctx: ctx, c: c, res: res}
 }
 
 // Handler returns the routes on a Go 1.22 method+pattern mux: the verb is
@@ -153,8 +163,15 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	// Step 1: the body must be the expected JSON shape. A body that will
 	// not decode is a client's mistake (400), never a 500 and never a
 	// panic — json.Decoder returns the problem as an ordinary error.
+	//
+	// Priority and Resources are the V7 scheduling intent. Both are optional:
+	// an older client's body leaves them at normal/no resources, so the V2
+	// contract survives. job.Priority unmarshals the wire names; an unknown
+	// name is a decode error, which is why it lands here as a 400.
 	var in struct {
-		Command []string `json:"command"`
+		Command   []string     `json:"command"`
+		Priority  job.Priority `json:"priority"`
+		Resources []string     `json:"resources"`
 	}
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&in); err != nil {
@@ -170,6 +187,25 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("api: bad request body: expected one JSON object"))
 		return
+	}
+
+	/*
+		Admission: a claim this server can never satisfy is refused now.
+		Waiting would be worse than failing — the worker would hold a slot
+		for a resource that will never exist, so the client would see a job
+		pending forever instead of a 400 it can act on. Validation runs
+		before the record exists, so a rejected claim stores nothing.
+	*/
+	if err := job.ValidateResources(in.Resources); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	for _, name := range in.Resources {
+		if !s.res.Configured(name) {
+			writeErr(w, http.StatusBadRequest,
+				fmt.Errorf("api: resource %q is not configured on this server", name))
+			return
+		}
 	}
 
 	// Step 2: identity comes from the server. crypto/rand gives 16 bytes of
@@ -197,7 +233,19 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	// a second record for the same intent, and the check plus the insert
 	// happen under the store's one lock — two concurrent retries cannot
 	// both create.
-	rec := store.Record{ID: id, Command: in.Command, Status: job.StatusPending, IdempotencyKey: key}
+	//
+	// Resources are stored sorted: "gpu,db" and "db,gpu" are the same claim,
+	// and a canonical order is what lets a replay comparison be a plain
+	// slices.Equal instead of set juggling.
+	slices.Sort(in.Resources)
+	rec := store.Record{
+		ID:             id,
+		Command:        in.Command,
+		Priority:       in.Priority,
+		Resources:      in.Resources,
+		Status:         job.StatusPending,
+		IdempotencyKey: key,
+	}
 	stored, created, err := s.st.Create(rec)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -215,9 +263,9 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			and V5's startup recovery already repairs a record that was
 			persisted but never queued.
 		*/
-		if !slices.Equal(stored.Command, in.Command) {
+		if !sameIntent(stored, rec) {
 			writeErr(w, http.StatusConflict,
-				fmt.Errorf("api: Idempotency-Key %q was used with a different command", key))
+				fmt.Errorf("api: Idempotency-Key %q was used with a different intent", key))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -248,6 +296,19 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 // maxIdempotencyKeyLen bounds one record's key. Opaque bytes, but not
 // unbounded: the store's file is the whole database.
 const maxIdempotencyKeyLen = 255
+
+/*
+sameIntent decides whether a replayed key names the job already stored. Since
+V7 a submission is a command PLUS a claim — same command on a different GPU
+or at a different priority is a different job, and answering 200 would tell
+the client its newer submission was accepted when the old one is what runs.
+Both sides are canonical (resources sorted) so this is plain equality.
+*/
+func sameIntent(stored, want store.Record) bool {
+	return slices.Equal(stored.Command, want.Command) &&
+		stored.Priority == want.Priority &&
+		slices.Equal(stored.Resources, want.Resources)
+}
 
 // newID returns 32 hex characters (16 random bytes). It returns an error
 // instead of panicking because AGENTS.md reserves panic for main/init —

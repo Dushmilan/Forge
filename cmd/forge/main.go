@@ -148,7 +148,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.New(ctx, q, st, w).Handler(),
+		Handler: api.New(ctx, q, st, w, pool).Handler(),
 	}
 
 	// Listen ourselves instead of srv.ListenAndServe() so we can print the

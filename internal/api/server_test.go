@@ -17,6 +17,7 @@ import (
 	"github.com/Dushmilan/Forge/internal/api"
 	"github.com/Dushmilan/Forge/internal/job"
 	"github.com/Dushmilan/Forge/internal/queue"
+	"github.com/Dushmilan/Forge/internal/resource"
 	"github.com/Dushmilan/Forge/internal/store"
 )
 
@@ -46,7 +47,15 @@ func newServer(t *testing.T) (*api.Server, *store.Store, *queue.Queue, *fakeCanc
 	st := store.New(t.TempDir())
 	q := queue.New()
 	c := &fakeCanceller{}
-	return api.New(context.Background(), q, st, c), st, q, c
+	return api.New(context.Background(), q, st, c, resource.New(nil)), st, q, c
+}
+
+// newServerWithResources is newServer with a pool that actually configures a
+// resource, so the admission checks have something to admit.
+func newServerWithResources(t *testing.T, caps map[string]int) (*api.Server, *store.Store) {
+	t.Helper()
+	st := store.New(t.TempDir())
+	return api.New(context.Background(), queue.New(), st, &fakeCanceller{}, resource.New(caps)), st
 }
 
 // TestGetJobFound pins the happy path: 200, JSON content type, and a body
@@ -214,7 +223,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := queue.New()
-	srv := api.New(context.Background(), q, store.New(filepath.Join(blocker, "data")), &fakeCanceller{})
+	srv := api.New(context.Background(), q, store.New(filepath.Join(blocker, "data")), &fakeCanceller{}, resource.New(nil))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/jobs",
@@ -250,7 +259,7 @@ func TestPostJobStoreFailure500(t *testing.T) {
 func TestPostJobCancelledRequest503(t *testing.T) {
 	dir := t.TempDir()
 	q := queue.New()
-	srv := api.New(context.Background(), q, store.New(dir), &fakeCanceller{})
+	srv := api.New(context.Background(), q, store.New(dir), &fakeCanceller{}, resource.New(nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // as if the server were already shutting down
@@ -308,7 +317,7 @@ func TestPostBlockedEnqueueGets503OnServerShutdown(t *testing.T) {
 	st := store.New(t.TempDir())
 	q := queue.New()
 	sctx, scancel := context.WithCancel(context.Background())
-	srv := api.New(sctx, q, st, &fakeCanceller{})
+	srv := api.New(sctx, q, st, &fakeCanceller{}, resource.New(nil))
 
 	gate := make(chan struct{})
 	defer close(gate) // frees the worker's handler on the way out
@@ -774,5 +783,169 @@ func TestPostJobTrailingJSONRejected(t *testing.T) {
 	h.ServeHTTP(good, req)
 	if good.Code != http.StatusAccepted {
 		t.Fatalf("retry status = %d, want 202 — the key must not be burned", good.Code)
+	}
+}
+
+// TestPostJobEchoesSchedulingIntent pins that priority and resources are
+// accepted on the wire and echoed back on the 202 — the client must not have
+// to re-read a GET to learn what the server understood. Resources come back
+// sorted, the canonical order the store and replays compare.
+func TestPostJobEchoesSchedulingIntent(t *testing.T) {
+	srv, st := newServerWithResources(t, map[string]int{"gpu": 2, "db": 1})
+	req := httptest.NewRequest(http.MethodPost, "/jobs",
+		strings.NewReader(`{"command":["train"],"priority":"high","resources":["gpu","db"]}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var body store.Record
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not a record: %v", err)
+	}
+	if body.Priority != job.PriorityHigh {
+		t.Errorf("priority = %v, want high", body.Priority)
+	}
+	if !slices.Equal(body.Resources, []string{"db", "gpu"}) {
+		t.Errorf("resources = %v, want [db gpu]", body.Resources)
+	}
+	saved, err := st.Get(body.ID)
+	if err != nil {
+		t.Fatalf("record was not persisted: %v", err)
+	}
+	if saved.Priority != job.PriorityHigh || !slices.Equal(saved.Resources, []string{"db", "gpu"}) {
+		t.Errorf("stored intent = %v/%v, want high/[db gpu]", saved.Priority, saved.Resources)
+	}
+}
+
+// TestPostJobNormalOmitsPriorityOnTheWire pins the compatibility half of the
+// wire format: a submission with no scheduling intent answers with JSON that
+// has no "priority" and no "resources" keys at all. omitempty on a type with
+// its own MarshalJSON is subtle — the zero check happens before marshalling —
+// so the guarantee gets a test rather than an assumption.
+func TestPostJobNormalOmitsPriorityOnTheWire(t *testing.T) {
+	srv, _ := newServerWithResources(t, nil)
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(`{"command":["true"]}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var keys map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &keys); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	for _, k := range []string{"priority", "resources"} {
+		if _, ok := keys[k]; ok {
+			t.Errorf("202 body carries %q for a normal job: %v", k, keys)
+		}
+	}
+}
+
+// TestPostJobRejectsUnrunnableClaims pins V7's admission boundary: a job
+// whose claim can never be satisfied is a client mistake (400) answered
+// immediately, never a record that sits pending forever waiting for a
+// resource nobody configured. Duplicates and the count cap come from
+// job.ValidateResources; the unknown name needs the pool.
+func TestPostJobRejectsUnrunnableClaims(t *testing.T) {
+	tooMany := make([]string, 0, 9)
+	for i := range 9 {
+		tooMany = append(tooMany, "r"+strconv.Itoa(i))
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"unknown resource", `{"command":["true"],"resources":["tpu"]}`},
+		{"duplicate resource", `{"command":["true"],"resources":["gpu","gpu"]}`},
+		{"too many resources", `{"command":["true"],"resources":` + mustJSON(t, tooMany) + `}`},
+		{"unknown priority", `{"command":["true"],"priority":"urgent"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, st := newServerWithResources(t, map[string]int{"gpu": 1})
+			req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+			}
+			all, err := st.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(all) != 0 {
+				t.Fatalf("stored %d records for a rejected claim, want none", len(all))
+			}
+		})
+	}
+}
+
+// mustJSON is the table's way to splice a generated slice into a body.
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestPostJobReplayComparesWholeIntent pins what V6's dedupe means now that a
+// submission carries more than a command: one Idempotency-Key is one INTENT.
+// A retry that changes priority or resources is a different job wearing the
+// same key — a 409 — while a byte-for-byte retry is still the 200 replay.
+func TestPostJobReplayComparesWholeIntent(t *testing.T) {
+	srv, _ := newServerWithResources(t, map[string]int{"gpu": 1})
+	h := srv.Handler()
+
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+		req.Header.Set("Idempotency-Key", "k7")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := post(`{"command":["train"],"priority":"high","resources":["gpu"]}`)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202 (body: %s)", first.Code, first.Body.String())
+	}
+	var original store.Record
+	if err := json.Unmarshal(first.Body.Bytes(), &original); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := []struct {
+		name string
+		body string
+	}{
+		{"different priority", `{"command":["train"],"priority":"low","resources":["gpu"]}`},
+		{"resources dropped", `{"command":["train"],"priority":"high"}`},
+		{"different command", `{"command":["other"],"priority":"high","resources":["gpu"]}`},
+	}
+	for _, tc := range changed {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := post(tc.body); rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	same := post(`{"command":["train"],"priority":"high","resources":["gpu"]}`)
+	if same.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (body: %s)", same.Code, same.Body.String())
+	}
+	var replay store.Record
+	if err := json.Unmarshal(same.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.ID != original.ID {
+		t.Errorf("replay id = %q, want the original %q", replay.ID, original.ID)
 	}
 }
