@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,8 +100,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	retryBackoff := fs.Duration("retry-backoff", 100*time.Millisecond, "first retry delay (doubles per attempt)")
 	jobTimeout := fs.Duration("job-timeout", 30*time.Second, "per-job deadline")
 	heartbeatInterval := fs.Duration("heartbeat-interval", time.Second, "how often a running job refreshes its heartbeat")
+	resources := fs.String("resources", "", "resource capacities, e.g. gpu=2,db=4")
 	if err := fs.Parse(args); err != nil {
 		return 2 // flag misuse is a usage error, like no-args in run
+	}
+	caps, err := parseResources(*resources)
+	if err != nil {
+		fmt.Fprintf(stderr, "forge: -resources: %v\n", err)
+		return 2 // a typo'd capacity must not become "no limits"
 	}
 	if *workers < 1 {
 		fmt.Fprintln(stderr, "forge: -workers must be >= 1")
@@ -125,7 +133,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	var e executor.Executor
 	st := store.New(*data)
 	q := queue.New()
-	pool := resource.New(nil) // V7 Task 8 replaces this with -resources
+	pool := resource.New(caps)
 	w := worker.New(st, e, worker.Config{
 		MaxAttempts: *maxAttempts,
 		Backoff:     *retryBackoff,
@@ -225,4 +233,38 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}
 		return 0
 	}
+}
+
+// parseResources turns "gpu=2,db=4" into a capacity map for resource.New.
+// It returns nil for the empty spec so the unconfigured server is the plain
+// no-resources case: a non-nil empty map would be a different value for the
+// same meaning. Every entry is validated here, at startup, because a worker
+// can only ever wait for capacity that exists — a typo'd name or a zero
+// capacity discovered at request time would block a job that can never run.
+func parseResources(spec string) (map[string]int, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	caps := make(map[string]int)
+	for _, entry := range strings.Split(spec, ",") {
+		name, val, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil, fmt.Errorf("entry %q is not name=count", entry)
+		}
+		if name == "" {
+			return nil, fmt.Errorf("entry %q has an empty resource name", entry)
+		}
+		if _, dup := caps[name]; dup {
+			return nil, fmt.Errorf("resource %q is listed twice", name)
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("resource %q: %q is not a number", name, val)
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("resource %q: capacity %d must be > 0", name, n)
+		}
+		caps[name] = n
+	}
+	return caps, nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -889,5 +890,56 @@ func TestRunServeReplaySurvivesRestart(t *testing.T) {
 	}
 	if lines := strings.Count(string(b), "run\n"); lines != 1 {
 		t.Errorf("command ran %d time(s) across the restart, want 1", lines)
+	}
+}
+
+// TestParseResources pins the -resources grammar. A capacity the operator
+// cannot type ("2x", 0, -1) must be refused at startup: a zero-capacity gate
+// is unreachable capacity, so the server would accept jobs that can never run.
+func TestParseResources(t *testing.T) {
+	for _, tt := range []struct {
+		spec    string
+		want    map[string]int
+		wantErr bool
+	}{
+		{"", nil, false},
+		{"gpu=1", map[string]int{"gpu": 1}, false},
+		{"gpu=2,db=4", map[string]int{"gpu": 2, "db": 4}, false},
+		{"gpu", nil, true},         // no '='
+		{"gpu=x", nil, true},       // not a number
+		{"gpu=0", nil, true},       // zero capacity is unreachable capacity
+		{"gpu=-1", nil, true},      // negative is nonsense
+		{"gpu=1,gpu=2", nil, true}, // duplicate name
+		{"=1", nil, true},          // empty name
+		{",", nil, true},           // empty entries
+	} {
+		t.Run(tt.spec, func(t *testing.T) {
+			got, err := parseResources(tt.spec)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseResources(%q) = %v, want an error", tt.spec, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseResources(%q): %v", tt.spec, err)
+			}
+			if !maps.Equal(got, tt.want) {
+				t.Errorf("parseResources(%q) = %v, want %v", tt.spec, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunServeInvalidResourcesExits2 pins the CLI contract: a bad capacity spec
+// is a usage error, not a server that starts with no limits.
+func TestRunServeInvalidResourcesExits2(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"serve", "-resources", "gpu=0"}, &stdout, &stderr); code != 2 {
+		t.Errorf("run(serve -resources gpu=0) = %d, want 2", code)
+	}
+	if stderr.Len() == 0 {
+		t.Error("stderr is empty, want an explanation of the bad capacity")
 	}
 }
