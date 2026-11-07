@@ -396,6 +396,99 @@ func TestExecutorRunCancelKillsGrandchildren(t *testing.T) {
 	}
 }
 
+/*
+TestExecutorRunWaitDelay pins the pipe bound. Capturing into a bytes.Buffer
+means os/exec owns a pipe and a copying goroutine, so Wait blocks until EOF —
+and a process that escaped the group (or outlived a successful exit) holds
+that EOF hostage. WaitDelay cuts the stream instead. Subtests also pin the
+limits honestly: the escapee survives, and an exit-0 with a lingering child
+becomes exec.ErrWaitDelay rather than a hang.
+*/
+func TestExecutorRunWaitDelay(t *testing.T) {
+	t.Run("escapee holds the pipe after cancel", func(t *testing.T) {
+		if _, err := exec.LookPath("setsid"); err != nil {
+			t.Skip("setsid not installed; cannot build an escapee")
+		}
+		marker := filepath.Join(t.TempDir(), "esc")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(ctx, job.Job{
+				ID:      "j-esc",
+				Command: []string{"sh", "-c", fmt.Sprintf("setsid sleep 60 & echo $! > %s; wait", strconv.Quote(marker))},
+			})
+			done <- err
+		}()
+
+		epid := pollForPid(t, marker)
+		/*
+			Synchronize on an observable fact before cancelling: the shell writes
+			the marker immediately after forking, so the escapee may not have
+			reached setsid() yet. Cancelling now would SIGKILL it inside the
+			group, and the subtest would then assert on a process that never
+			escaped. getpgid reports the new group only after setsid, so a bounded
+			poll — never a fixed sleep — makes the escape happen before cancel.
+		*/
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if pgid, err := syscall.Getpgid(epid); err == nil && pgid == epid {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("pid %d never left its parent's process group", epid)
+			}
+			time.Sleep(time.Millisecond) // poll interval only
+		}
+		start := time.Now()
+		cancel()
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v, want wrapped context.Canceled", err)
+			}
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("Run took %v after cancel, want ~waitDelay (1s)", elapsed)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run hung after cancel — the escapee's pipe was never cut")
+		}
+
+		if state := procState(epid); state != "R" && state != "S" && state != "Z" {
+			t.Errorf("escapee state = %q, want alive — escaping the group is the documented limit", state)
+		}
+		syscall.Kill(epid, syscall.SIGKILL) // test cleanup: no leaked sleepers
+	})
+
+	// The non-cancel flavour: the child exits 0, but a background child keeps
+	// the capture pipe open. Without WaitDelay this hangs forever; with it,
+	// exec.ErrWaitDelay surfaces because the context is NOT done (so the
+	// executor's ctx.Err() preference must not mask it).
+	t.Run("exit 0 with a lingering child", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "bg")
+		done := make(chan error, 1)
+		go func() {
+			_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(context.Background(), job.Job{
+				ID:      "j-bg",
+				Command: []string{"sh", "-c", fmt.Sprintf("sleep 60 & echo $! > %s; exit 0", strconv.Quote(marker))},
+			})
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, exec.ErrWaitDelay) {
+				t.Fatalf("Run() error = %v, want wrapped exec.ErrWaitDelay", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run hung on a background child after a successful exit")
+		}
+		syscall.Kill(pollForPid(t, marker), syscall.SIGKILL) // test cleanup
+	})
+}
+
 // procState reads /proc/<pid>/stat: "gone" when reaped, "Z" when dead but
 // unreaped, otherwise the kernel's state letter.
 func procState(pid int) string {

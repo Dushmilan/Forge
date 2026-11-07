@@ -12,9 +12,16 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/Dushmilan/Forge/internal/job"
 )
+
+// waitDelay bounds how long Wait may sit on a capture pipe after the child is
+// done: the group is SIGKILLed on cancel, so nothing inside it needs grace —
+// this exists only for processes that escaped the group or outlived the exit
+// and still hold the stream.
+const waitDelay = time.Second
 
 // Result is what happened when a Job ran. It is a plain value: callers can
 // copy it, log it, or serialize it without touching the process that produced it.
@@ -124,6 +131,15 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // negative pid = the whole group
 	}
+	/*
+		Capturing into a bytes.Buffer makes os/exec own an OS pipe and a copying
+		goroutine, so Wait blocks until EOF — not merely until the child exits.
+		A process that escaped the group, or a background child after a clean
+		exit, still holds the write end, and EOF never arrives. WaitDelay closes
+		those pipes once the child is done, converting an unbounded Wait into a
+		bounded one; a zero value would wait on the pipe forever.
+	*/
+	cmd.WaitDelay = waitDelay
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
