@@ -102,8 +102,11 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 	// CommandContext ties the child's life to ctx: when ctx is done it kills
 	// the process. That is the whole cancellation mechanism at this layer.
 	cmd := exec.CommandContext(ctx, j.Command[0], j.Command[1:]...)
-	// Dir is the child's working directory: the fresh sandbox, never the
-	// parent process's cwd, so concurrent jobs cannot see each other's files.
+	// Dir is the child's working directory: a fresh sandbox per run, so jobs
+	// do not share a working directory by default. The directory lives for
+	// the duration of Run (removed when Run returns); an escaped descendant
+	// can outlive Wait and keep using the removed path, and same-UID
+	// processes can still discover each other outside it.
 	cmd.Dir = dir
 	/*
 		cmd.Env REPLACES inheritance: this is every variable the child gets, so

@@ -261,10 +261,14 @@ Template:
   not merely until the child exits — a process that escaped the group (or a
   background child after a clean exit 0) holds the write end forever, and
   `WaitDelay` is the bound that converts an unbounded `Wait` into a bounded
-  one. `os.MkdirTemp` + `defer os.RemoveAll` is filesystem scoping: the
-  directory exists exactly as long as a process might be using it, and the
-  `defer` registered before `cmd.Run` is what makes the cleanup cover every
-  return path, after the child is gone, not just the success one.
+  one. `os.MkdirTemp` + `defer os.RemoveAll` is filesystem scoping: each run gets
+  its own working directory, so jobs do not share a working directory by
+  default, but that is not isolation — same-UID processes can still discover
+  each other, and an escaped descendant can outlive `Wait` and keep using
+  the removed directory. The directory's lifetime is tied to `Run` (it is
+  removed when `Run` returns), and the `defer` registered before `cmd.Run`
+  is what makes the cleanup cover every return path, not just the success
+  one.
 - **What I built:** `Executor.SandboxRoot` (zero value → `os.TempDir()`, so
   `Executor{}` stays a working Runner); a per-run `MkdirTemp` sandbox removed
   with a deferred `RemoveAll`; `cmd.Env` replaced with `PATH` only; the

@@ -205,8 +205,14 @@ func TestExecutorRunSandboxDirectory(t *testing.T) {
 			t.Fatalf("Run() error = %v, want nil", err)
 		}
 		got := strings.TrimSpace(res.Stdout)
-		if !strings.HasPrefix(got, root) {
-			t.Errorf("pwd = %q, want a directory under %q", got, root)
+		if filepath.Dir(got) != root {
+			t.Errorf("pwd = %q, want a direct child of %q", got, root)
+		}
+		if !strings.HasPrefix(filepath.Base(got), "forge-job-") {
+			t.Errorf("pwd = %q, want a forge-job-* sandbox", got)
+		}
+		if _, err := os.Stat(got); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("sandbox dir %q still exists after Run, want removed", got)
 		}
 		assertDirEmpty(t, root)
 	})
@@ -250,8 +256,15 @@ func TestExecutorRunSandboxDirectory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run() error = %v, want nil", err)
 		}
-		if got := strings.TrimSpace(res.Stdout); !strings.HasPrefix(got, root) {
-			t.Errorf("pwd = %q, want a directory under %q", got, root)
+		got := strings.TrimSpace(res.Stdout)
+		if filepath.Dir(got) != root {
+			t.Errorf("pwd = %q, want a direct child of %q", got, root)
+		}
+		if !strings.HasPrefix(filepath.Base(got), "forge-job-") {
+			t.Errorf("pwd = %q, want a forge-job-* sandbox", got)
+		}
+		if _, err := os.Stat(got); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("sandbox dir %q still exists after Run, want removed", got)
 		}
 		assertDirEmpty(t, root)
 	})
@@ -273,6 +286,8 @@ func TestExecutorRunSandboxDirectory(t *testing.T) {
 	// concurrent: two runs, one root, distinct directories, both clean after.
 	t.Run("concurrent", func(t *testing.T) {
 		root := t.TempDir()
+		var mu sync.Mutex
+		var dirs []string
 		var wg sync.WaitGroup
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
@@ -284,12 +299,25 @@ func TestExecutorRunSandboxDirectory(t *testing.T) {
 					t.Errorf("Run() error = %v, want nil", err)
 					return
 				}
-				if !strings.HasPrefix(strings.TrimSpace(res.Stdout), root) {
-					t.Errorf("pwd = %q, want a directory under %q", res.Stdout, root)
+				got := strings.TrimSpace(res.Stdout)
+				if filepath.Dir(got) != root {
+					t.Errorf("pwd = %q, want a direct child of %q", got, root)
 				}
+				if !strings.HasPrefix(filepath.Base(got), "forge-job-") {
+					t.Errorf("pwd = %q, want a forge-job-* sandbox", got)
+				}
+				if _, err := os.Stat(got); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("sandbox dir %q still exists after Run, want removed", got)
+				}
+				mu.Lock()
+				dirs = append(dirs, got)
+				mu.Unlock()
 			}()
 		}
 		wg.Wait()
+		if len(dirs) == 2 && dirs[0] == dirs[1] {
+			t.Errorf("concurrent runs shared a sandbox dir: %q", dirs[0])
+		}
 		assertDirEmpty(t, root)
 	})
 }
@@ -335,6 +363,7 @@ func TestExecutorRunChildLeadsItsProcessGroup(t *testing.T) {
 	}()
 
 	pid := pollForPid(t, pidFile) // helper: bounded poll, 5s deadline
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
 		t.Fatalf("Getpgid(%d): %v", pid, err)
@@ -359,13 +388,15 @@ awaiting reap) as well as a missing /proc entry — a correct kill does not
 always mean a reaped pid.
 */
 func TestExecutorRunCancelKillsGrandchildren(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "gp")
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "gp")
+	root := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(ctx, job.Job{
+		_, err := (executor.Executor{SandboxRoot: root}).Run(ctx, job.Job{
 			ID:      "j-tree",
 			Command: []string{"sh", "-c", fmt.Sprintf("sleep 60 & echo $! > %s; wait", strconv.Quote(marker))},
 		})
@@ -373,6 +404,7 @@ func TestExecutorRunCancelKillsGrandchildren(t *testing.T) {
 	}()
 
 	gpid := pollForPid(t, marker)
+	t.Cleanup(func() { syscall.Kill(gpid, syscall.SIGKILL) })
 	cancel()
 
 	select {
@@ -383,6 +415,8 @@ func TestExecutorRunCancelKillsGrandchildren(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
+
+	assertDirEmpty(t, root)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -423,6 +457,7 @@ func TestExecutorRunWaitDelay(t *testing.T) {
 		}()
 
 		epid := pollForPid(t, marker)
+		t.Cleanup(func() { syscall.Kill(epid, syscall.SIGKILL) })
 		/*
 			Synchronize on an observable fact before cancelling: the shell writes
 			the marker immediately after forking, so the escapee may not have
@@ -456,7 +491,7 @@ func TestExecutorRunWaitDelay(t *testing.T) {
 			t.Fatal("Run hung after cancel — the escapee's pipe was never cut")
 		}
 
-		if state := procState(epid); state != "R" && state != "S" && state != "Z" {
+		if state := procState(epid); state == "gone" || state == "Z" || state == "X" {
 			t.Errorf("escapee state = %q, want alive — escaping the group is the documented limit", state)
 		}
 		syscall.Kill(epid, syscall.SIGKILL) // test cleanup: no leaked sleepers
@@ -477,6 +512,8 @@ func TestExecutorRunWaitDelay(t *testing.T) {
 			done <- err
 		}()
 
+		bgpid := pollForPid(t, marker)
+		t.Cleanup(func() { syscall.Kill(bgpid, syscall.SIGKILL) })
 		select {
 		case err := <-done:
 			if !errors.Is(err, exec.ErrWaitDelay) {
@@ -485,7 +522,7 @@ func TestExecutorRunWaitDelay(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("Run hung on a background child after a successful exit")
 		}
-		syscall.Kill(pollForPid(t, marker), syscall.SIGKILL) // test cleanup
+		syscall.Kill(bgpid, syscall.SIGKILL) // test cleanup
 	})
 }
 
@@ -494,9 +531,15 @@ func TestExecutorRunWaitDelay(t *testing.T) {
 func procState(pid int) string {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return "gone"
+		if errors.Is(err, fs.ErrNotExist) {
+			return "gone"
+		}
+		return "unreadable"
 	}
 	f := strings.Fields(string(b))
+	if len(f) < 3 {
+		return "unreadable"
+	}
 	return f[2]
 }
 
