@@ -351,6 +351,62 @@ func TestExecutorRunChildLeadsItsProcessGroup(t *testing.T) {
 	}
 }
 
+/*
+TestExecutorRunCancelKillsGrandchildren pins V8's headline: cancellation is a
+tree operation. The marker file proves the grandchild started, so the test
+cannot pass by refusing to launch it. The assertion accepts state Z (dead,
+awaiting reap) as well as a missing /proc entry — a correct kill does not
+always mean a reaped pid.
+*/
+func TestExecutorRunCancelKillsGrandchildren(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "gp")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(ctx, job.Job{
+			ID:      "j-tree",
+			Command: []string{"sh", "-c", fmt.Sprintf("sleep 60 & echo $! > %s; wait", strconv.Quote(marker))},
+		})
+		done <- err
+	}()
+
+	gpid := pollForPid(t, marker)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want wrapped context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if state := procState(gpid); state == "gone" || state == "Z" {
+			return // dead (reaped or awaiting reap)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild %d still running after cancel, state=%s", gpid, procState(gpid))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// procState reads /proc/<pid>/stat: "gone" when reaped, "Z" when dead but
+// unreaped, otherwise the kernel's state letter.
+func procState(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return "gone"
+	}
+	f := strings.Fields(string(b))
+	return f[2]
+}
+
 // pollForPid waits (bounded, 5s deadline) for a file holding one integer pid.
 // Polling with a deadline, not time.Sleep: the deadline is the guarantee.
 func pollForPid(t *testing.T, path string) int {

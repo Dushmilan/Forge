@@ -113,6 +113,17 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 		misses it (ESRCH), and grandchildren of a shell outlive the job.
 	*/
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	/*
+		Cancel is the signal CommandContext sends when ctx ends, and its default
+		calls Process.Kill on ONE pid — so a shell's children would survive and
+		keep the job's pipes open. Ours sends SIGKILL to the whole group created
+		by Setpgid above: the negative pid is the Go/Unix convention for "every
+		process in this group". os/exec calls Cancel only after Start succeeds,
+		which is what makes cmd.Process (and its Pid) safe to read here.
+	*/
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // negative pid = the whole group
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
