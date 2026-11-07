@@ -295,7 +295,7 @@ func TestExecutorRunChildLeadsItsProcessGroup(t *testing.T) {
 	go func() {
 		_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(ctx, job.Job{
 			ID:      "j-pgid",
-			Command: []string{"sh", "-c", fmt.Sprintf("echo $$ > %s; sleep 60", strconv.Quote(pidFile))},
+			Command: []string{"sh", "-c", fmt.Sprintf("echo $$ > %s; exec sleep 60", strconv.Quote(pidFile))},
 		})
 		done <- err
 	}()
