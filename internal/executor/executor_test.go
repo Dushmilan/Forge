@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -310,6 +311,62 @@ func TestExecutorRunScrubsEnvironment(t *testing.T) {
 	}
 	if got := strings.TrimSpace(res.Stdout); got != "unset|ok" {
 		t.Errorf("Stdout = %q, want %q", got, "unset|ok")
+	}
+}
+
+/*
+TestExecutorRunChildLeadsItsProcessGroup pins the invariant the group kill
+depends on: with Setpgid the child's pgid equals its own pid. Without it the
+child joins forge's group and kill(-childpid) would address a group that does
+not exist.
+*/
+func TestExecutorRunChildLeadsItsProcessGroup(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(ctx, job.Job{
+			ID:      "j-pgid",
+			Command: []string{"sh", "-c", fmt.Sprintf("echo $$ > %s; exec sleep 60", strconv.Quote(pidFile))},
+		})
+		done <- err
+	}()
+
+	pid := pollForPid(t, pidFile) // helper: bounded poll, 5s deadline
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		t.Fatalf("Getpgid(%d): %v", pid, err)
+	}
+	if pgid != pid {
+		t.Errorf("Getpgid(%d) = %d, want the child to lead its own group", pid, pgid)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// pollForPid waits (bounded, 5s deadline) for a file holding one integer pid.
+// Polling with a deadline, not time.Sleep: the deadline is the guarantee.
+func pollForPid(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid file %q never appeared", path)
+		}
+		time.Sleep(time.Millisecond) // poll interval only
 	}
 }
 

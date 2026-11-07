@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 
 	"github.com/Dushmilan/Forge/internal/job"
 )
@@ -104,6 +105,14 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 		child's own `sh -c` needs it to find commands.
 	*/
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	/*
+		Setpgid makes the child the leader of a NEW process group whose id is its
+		own pid. This and Task 4's kill(-pid, ...) are an inseparable pair: the
+		negative pid addresses a whole group, which only exists because this line
+		created it — without it the child inherits forge's group, kill(-pid)
+		misses it (ESRCH), and grandchildren of a shell outlive the job.
+	*/
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
