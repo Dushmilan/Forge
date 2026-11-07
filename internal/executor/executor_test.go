@@ -293,6 +293,26 @@ func TestExecutorRunSandboxDirectory(t *testing.T) {
 	})
 }
 
+/*
+TestExecutorRunScrubsEnvironment pins replacement, not inheritance: setting
+cmd.Env wholesale means forge's variables do not exist for the child, while
+PATH survives so binaries still resolve.
+*/
+func TestExecutorRunScrubsEnvironment(t *testing.T) {
+	t.Setenv("FORGE_SANDBOX_LEAK", "sentinel")
+
+	res, err := (executor.Executor{SandboxRoot: t.TempDir()}).Run(
+		context.Background(),
+		job.Job{ID: "j-env", Command: []string{"sh", "-c",
+			`printf '%s|' "${FORGE_SANDBOX_LEAK:-unset}"; command -v sleep >/dev/null && printf ok`}})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if got := strings.TrimSpace(res.Stdout); got != "unset|ok" {
+		t.Errorf("Stdout = %q, want %q", got, "unset|ok")
+	}
+}
+
 // assertDirEmpty fails if root still holds an entry: the sandbox is removed
 // when Run returns, on every path.
 func assertDirEmpty(t *testing.T, root string) {

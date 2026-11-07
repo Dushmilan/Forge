@@ -97,6 +97,13 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 	// Dir is the child's working directory: the fresh sandbox, never the
 	// parent process's cwd, so concurrent jobs cannot see each other's files.
 	cmd.Dir = dir
+	/*
+		cmd.Env REPLACES inheritance: this is every variable the child gets, so
+		forge's environment cannot leak into a job by omission. PATH is copied
+		explicitly because exec.LookPath resolves the program through it and the
+		child's own `sh -c` needs it to find commands.
+	*/
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
