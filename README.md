@@ -5,9 +5,8 @@ by building it. Each version (V0 → V11) introduces one set of core Go
 concepts: structs and interfaces, then HTTP, channels, `sync`, `context`,
 `container/heap`, `os/exec`, `slog`, pprof, and beyond.
 
-**Status:** V0–V7 are done, tagged `v0`–`v7`. Next up is V8 —
-sandboxed execution (`os/exec`, processes, signals, filesystem); its spec is
-not written yet.
+**Status:** V0–V8 are done, tagged `v0`–`v8`. Next up is V9 —
+observability (`slog`, `expvar`, `pprof`, metrics).
 
 ## Quick start
 
@@ -289,6 +288,26 @@ resource can stall unrelated jobs behind it. There is no preemption and no
 aging, so a stream of `critical` jobs can starve `low` ones. Capacity is
 per-process, which V11 has to change.
 
+## How it works (V8)
+
+V8 gives every job a room of its own instead of running it inside forge's
+working directory and environment. Each run starts with a fresh
+`os.MkdirTemp` directory (pattern `forge-job-`; the name never derives from
+the job id) as the child's cwd, deleted once `Wait` returns — retries get a
+new one per attempt — and the child's environment is *replaced* wholesale:
+`cmd.Env` is the whole list, so the child sees forge's `PATH` and nothing
+else. Because a job that spawns children would otherwise outlive its kill,
+the child leads its own process group (`Setpgid`) and cancellation sends
+`SIGKILL` to the whole group (`syscall.Kill(-pid)`), so grandchildren of a
+shell die with the job. Captured output is pipes, and a process that escaped
+the group can hold them open after the child is gone; `cmd.WaitDelay` (one
+second) makes `os/exec` cut those streams so `Run` returns instead of
+hanging — and a job that exits 0 while a background child keeps the pipe open
+fails with `exec.ErrWaitDelay` rather than blocking forever. The honest
+limit: this is a clean room, not a jail. No namespaces, cgroups, or chroot —
+a job can still write anywhere the forge user may write. `Setpgid` and
+negative pids are Unix-only, and V8 says so.
+
 ## The ladder
 
 | Ver | Theme                          | Go concepts introduced                          | Status |
@@ -301,7 +320,7 @@ per-process, which V11 has to change.
 | V5  | Heartbeats + failure recovery  | tickers, timeouts, state machines                | ✅     |
 | V6  | Idempotency                    | maps, keys, dedupe, atomicity                    | ✅     |
 | V7  | Priority/resource scheduling   | `container/heap`, semaphores, interfaces         | ✅     |
-| V8  | Sandboxed execution            | `os/exec`, processes, signals, filesystem        | ⏳     |
+| V8  | Sandboxed execution            | `os/exec`, processes, signals, filesystem        | ✅     |
 | V9  | Observability                  | `slog`, `expvar`, `pprof`, metrics               | ⏳     |
 | V10 | Load testing + profiling       | `testing.B`, pprof, escape analysis              | ⏳     |
 | V11 | Horizontal scaling             | distributed state, coordination                  | ⏳     |

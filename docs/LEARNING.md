@@ -246,3 +246,49 @@ Template:
   in the spec and the part I re-derived most slowly; the mutation test (make
   `Acquire` a no-op, watch two `gpu` jobs interleave) proved the guard faster
   than rereading it.
+
+## V8 — Sandboxed execution
+
+- **Concept:** Assigning `cmd.Env` is a *replacement*, not a patch — the field
+  is the whole list the child receives, so "clear the environment" is not a
+  loop of `Unsetenv`s for the variables you thought of, it is a one-line
+  decision about which variables exist. Cancellation is a property of a
+  process *group*, not a pid, and the group only exists if you create it:
+  `SysProcAttr.Setpgid: true` and `syscall.Kill(-pid, sig)` are an inseparable
+  pair — the negative pid addresses the group that `Setpgid` made, and sending
+  it without one is `ESRCH`. Capturing into `bytes.Buffer` means `os/exec`
+  owns a pipe and a copying goroutine per stream, so `Wait` blocks until EOF,
+  not merely until the child exits — a process that escaped the group (or a
+  background child after a clean exit 0) holds the write end forever, and
+  `WaitDelay` is the bound that converts an unbounded `Wait` into a bounded
+  one. `os.MkdirTemp` + `defer os.RemoveAll` is filesystem scoping: the
+  directory exists exactly as long as a process might be using it, and the
+  `defer` registered before `cmd.Run` is what makes the cleanup cover every
+  return path, after the child is gone, not just the success one.
+- **What I built:** `Executor.SandboxRoot` (zero value → `os.TempDir()`, so
+  `Executor{}` stays a working Runner); a per-run `MkdirTemp` sandbox removed
+  with a deferred `RemoveAll`; `cmd.Env` replaced with `PATH` only; the
+  `Setpgid` + group-`SIGKILL` pair wired through `cmd.Cancel`; `cmd.WaitDelay`
+  of one second; and tests proving the grandchild of a shell dies with the
+  job, the `setsid` escapee does not hang `Run`, exit 0 with a held stream
+  fails as `exec.ErrWaitDelay`, and a job id of `../../evil` never names the
+  directory.
+- **What surprised me:** The `ESRCH` discovery. I wrote `kill(-childpid)`
+  first and reasoned from the man page that it would address the child's
+  group; it failed with errno 3, because a child that was never put in its own
+  group *inherits forge's group*, and `-childpid` names a group nobody made.
+  No amount of manual reading said that as loudly as one run did. Equally
+  surprising: `Wait` does not wait for the process, it waits for the pipes —
+  my mental model of "child exited, Wait returns" simply was not what the
+  standard library does, and `WaitDelay` exists precisely because neither of
+  us can close a stranger's pipe.
+- **Idiom worth remembering:** Pair rules go in the same commit: `Setpgid` and
+  the negative pid, or the kill silently misses. And prefer the
+  order-dependent `defer` over the clever cleanup: `MkdirTemp` before the
+  command starts, `RemoveAll` deferred immediately — so the directory outlives
+  every error return but never a live child.
+- **Next time:** Say what the mechanism does *not* do before the tests. "A
+  clean room, not a jail" — written in the spec — is what produced the
+  escapee-is-still-alive assertion rather than an accidental green test.
+  Confinement (namespaces, cgroups) is a different charter; don't let the
+  word "sandbox" quietly promise it.
