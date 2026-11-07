@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,5 +188,120 @@ func TestExecutorRunDeadlineExceeded(t *testing.T) {
 	_, err := (executor.Executor{}).Run(ctx, job.Job{ID: "j-timeout", Command: []string{"sleep", "10"}})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run() error = %v, want wrapped context.DeadlineExceeded", err)
+	}
+}
+
+// TestExecutorRunSandboxDirectory pins V8's room: every run happens in a fresh
+// directory under SandboxRoot, the directory is gone when Run returns, and
+// nothing about the job — not even a hostile id — chooses its path.
+func TestExecutorRunSandboxDirectory(t *testing.T) {
+	// success: pwd reports a directory under the root, and the root is empty after.
+	t.Run("success", func(t *testing.T) {
+		root := t.TempDir()
+		res, err := (executor.Executor{SandboxRoot: root}).Run(
+			context.Background(), job.Job{ID: "j-cwd", Command: []string{"sh", "-c", "pwd"}})
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		got := strings.TrimSpace(res.Stdout)
+		if !strings.HasPrefix(got, root) {
+			t.Errorf("pwd = %q, want a directory under %q", got, root)
+		}
+		assertDirEmpty(t, root)
+	})
+
+	// failure: a non-zero exit still cleans up.
+	t.Run("failure", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := (executor.Executor{SandboxRoot: root}).Run(
+			context.Background(), job.Job{ID: "j-fail", Command: []string{"false"}}); err == nil {
+			t.Fatal("Run() error = nil, want an error")
+		}
+		assertDirEmpty(t, root)
+	})
+
+	// cancelled before start: a dead context must not create anything.
+	t.Run("cancelled", func(t *testing.T) {
+		root := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := (executor.Executor{SandboxRoot: root}).Run(ctx, job.Job{ID: "j-c", Command: []string{"sleep", "60"}})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want wrapped context.Canceled", err)
+		}
+		assertDirEmpty(t, root)
+	})
+
+	// invalid job: rejected before the filesystem is touched.
+	t.Run("invalid", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := (executor.Executor{SandboxRoot: root}).Run(context.Background(), job.Job{}); !errors.Is(err, job.ErrInvalidJob) {
+			t.Fatalf("Run() error = %v, want wrapped job.ErrInvalidJob", err)
+		}
+		assertDirEmpty(t, root)
+	})
+
+	// hostile id: Validate allows it; it must not reach the path.
+	t.Run("hostile id", func(t *testing.T) {
+		root := t.TempDir()
+		res, err := (executor.Executor{SandboxRoot: root}).Run(
+			context.Background(), job.Job{ID: "../../evil", Command: []string{"sh", "-c", "pwd"}})
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		if got := strings.TrimSpace(res.Stdout); !strings.HasPrefix(got, root) {
+			t.Errorf("pwd = %q, want a directory under %q", got, root)
+		}
+		assertDirEmpty(t, root)
+	})
+
+	// missing root: configuration error, wrapped, no process started.
+	t.Run("missing root", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "nope")
+		_, err := (executor.Executor{SandboxRoot: root}).Run(
+			context.Background(), job.Job{ID: "j-noroot", Command: []string{"echo", "x"}})
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Run() error = %v, want wrapped fs.ErrNotExist", err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			t.Errorf("Run() error = %v, want a config error, not a process failure", err)
+		}
+	})
+
+	// concurrent: two runs, one root, distinct directories, both clean after.
+	t.Run("concurrent", func(t *testing.T) {
+		root := t.TempDir()
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res, err := (executor.Executor{SandboxRoot: root}).Run(
+					context.Background(), job.Job{ID: "j-par", Command: []string{"sh", "-c", "pwd"}})
+				if err != nil {
+					t.Errorf("Run() error = %v, want nil", err)
+					return
+				}
+				if !strings.HasPrefix(strings.TrimSpace(res.Stdout), root) {
+					t.Errorf("pwd = %q, want a directory under %q", res.Stdout, root)
+				}
+			}()
+		}
+		wg.Wait()
+		assertDirEmpty(t, root)
+	})
+}
+
+// assertDirEmpty fails if root still holds an entry: the sandbox is removed
+// when Run returns, on every path.
+func assertDirEmpty(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", root, err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("sandbox root holds %d entries after Run, want 0", len(entries))
 	}
 }

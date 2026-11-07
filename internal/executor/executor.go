@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 
 	"github.com/Dushmilan/Forge/internal/job"
@@ -22,10 +23,14 @@ type Result struct {
 	Stderr   string
 }
 
-// Executor runs jobs. It holds no state in V0; the struct exists so later
-// versions can give it configuration (timeouts, worker counts, sandboxes)
-// without every caller having to change the call shape.
-type Executor struct{}
+// Executor runs jobs. It holds configuration only; V0 needed none, V8 adds the
+// sandbox parent, and later versions can add more without changing Run's shape.
+type Executor struct {
+	// SandboxRoot is the parent directory for per-run sandboxes. The zero value
+	// uses os.TempDir(): Executor{} stays a working Runner, so callers never
+	// have to know the sandbox exists.
+	SandboxRoot string
+}
 
 // Runner is the seam callers depend on. Go's guidance is "accept interfaces,
 // return concrete types": keep one small method here, leave Executor a concrete
@@ -61,15 +66,41 @@ func (e Executor) Run(ctx context.Context, j job.Job) (Result, error) {
 		return Result{}, fmt.Errorf("job %q: %w", j.ID, err)
 	}
 
+	/*
+		Create the sandbox only after validation and the context check: a job
+		that cannot run must leave no directory behind. MkdirTemp appends a
+		random suffix to the pattern, so the job id never becomes part of a
+		path — a hostile id cannot escape the root by choosing its own name.
+	*/
+	root := e.SandboxRoot
+	if root == "" {
+		// The zero value means the ordinary temp directory, NOT "no sandbox":
+		// Executor{} must keep working without callers opting in.
+		root = os.TempDir()
+	}
+	dir, err := os.MkdirTemp(root, "forge-job-")
+	if err != nil {
+		return Result{}, fmt.Errorf("job %q: sandbox: %w", j.ID, err)
+	}
+	/*
+		defer runs after cmd.Run has returned, so no live child has files
+		deleted from under it; it also covers every error return after this
+		point, which is what makes cleanup total rather than success-only.
+	*/
+	defer os.RemoveAll(dir)
+
 	var stdout, stderr bytes.Buffer
 
 	// CommandContext ties the child's life to ctx: when ctx is done it kills
 	// the process. That is the whole cancellation mechanism at this layer.
 	cmd := exec.CommandContext(ctx, j.Command[0], j.Command[1:]...)
+	// Dir is the child's working directory: the fresh sandbox, never the
+	// parent process's cwd, so concurrent jobs cannot see each other's files.
+	cmd.Dir = dir
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
 
 	// ProcessState is non-nil once the process actually started, even if it
